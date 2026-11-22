@@ -56,7 +56,7 @@ The same runtime serves the unmodified checkpoint mirrored here. With that confi
 
 ## Install and run
 
-Version 1.2.1 fixes a ROCm busy wait that can keep a CPU core saturated while the server is idle on a single-GPU Strix Halo setup. Use the updated launcher and restart the server. Your existing checkpoint files can be reused. [v1.2.1 release](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151/releases/tag/v1.2.1)
+Version 1.2.2 uses AMD's ROCr fix for the idle CPU polling loop in the bundled ROCm 10.0 stack. Install the new runtime and restart the server to use it. Your existing checkpoint files can be reused. [v1.2.2 release](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151/releases/tag/v1.2.2)
 
 Install the ROCm vLLM runtime from the companion GitHub repository. The installation guide covers GPU access, dependencies, the checked-in installer, launch commands for the original and optimized weights, and verification through the OpenAI-compatible API. [GitHub runtime](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151) · [Installation guide](INSTALL.md)
 

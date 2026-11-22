@@ -42,7 +42,7 @@ The last command should display a HIP version and an architecture beginning with
 ```bash
 git clone https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151.git
 cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
-INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.2.1"
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.2.2"
 INKLING_MODEL="$HOME/models/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151"
 
 bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
@@ -54,7 +54,7 @@ The installer verifies the package and model checksums, retrieves the pinned [vL
 
 You can also run `bash scripts/install.sh` from the root of the complete Hugging Face download.
 
-When upgrading an existing clone, run `git fetch origin --tags` and `git switch --detach v1.2.1`. Use the new install prefix above and omit `--download-model` to reuse the checkpoint files already on disk. Stop the previous server and start the new prefix's `serve.sh` to apply the idle CPU fix.
+When upgrading an existing clone, run `git fetch origin --tags` and `git switch --detach v1.2.2`. Use the new install prefix above and omit `--download-model` to reuse the checkpoint files already on disk. Stop the previous server and start the new prefix's `serve.sh` to apply the idle CPU fix.
 
 Use `bash scripts/install.sh --verify-only` to check package integrity without downloading or installing anything. Add `--venv "$HOME/.venvs/inkling-halo"` to check the wheel versions and ROCm extension. Add `--transformers-deps "$HOME/.local/share/inkling-halo/transformers-deps"` with that virtual environment to verify the isolated dependencies.
 
@@ -76,7 +76,7 @@ python3 scripts/smoke-test.py --check-tools
 
 The API base URL is `http://127.0.0.1:18753/v1` and the model ID is `main`. The first launch builds a local Triton kernel cache and may take longer. Use `--dry-run` to preview the selected launch settings.
 
-Start the server through `serve.sh` to set HIP blocking waits before vLLM and its worker initialize ROCm. This fix was verified with one visible Strix Halo GPU. On multi-GPU hosts, use `ROCR_VISIBLE_DEVICES` to expose only the Strix Halo GPU to the launcher. [ROCm issue](https://github.com/ROCm/TheRock/issues/7051)
+Start the server through `serve.sh` to load the corrected ROCr library for the pinned ROCm 10.0 SDK. The launcher checks the SDK and library checksums. The backport was built on Ubuntu 24.04 LTS and tested on NixOS with one visible Strix Halo GPU. On multi-GPU hosts, use `ROCR_VISIBLE_DEVICES` to expose only the Strix Halo GPU. [AMD ROCr fix](https://github.com/ROCm/rocm-systems/pull/7898)
 
 Set `--context` to override the request limit. The launcher sizes the KV pool from that limit unless you set `--kv-mib` explicitly. Choose a smaller context and cache budget on systems with less available memory.
 

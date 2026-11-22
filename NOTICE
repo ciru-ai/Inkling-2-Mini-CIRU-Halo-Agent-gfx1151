@@ -17,3 +17,9 @@ https://github.com/vllm-project/vllm
 The installer retrieves separately maintained Transformers source from Hugging
 Face, also distributed under the Apache License, Version 2.0.
 https://github.com/huggingface/transformers
+
+The bundled ROCr library is from AMD ROCr revision
+6b0e43f341195e203754e08f850e437ff2fc09f9, with AMD's idle-polling fix
+46558b7af4dc79b8b8014619c1afdb82db079a9f. The associated source patch and
+license notices are in scripts/rocm/.
+https://github.com/ROCm/rocm-systems
