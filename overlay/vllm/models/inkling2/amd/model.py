@@ -630,15 +630,15 @@ class Inkling2LoopForConditionalGeneration(
                 and spec is not None
                 and spec.method == "dspark"
                 and 1 <= spec.num_speculative_tokens <= 7
-                and spec.draft_sample_method == "greedy"
+                and spec.draft_sample_method in ("greedy", "probabilistic")
                 and parallel.data_parallel_size == 1
             )
-            if vllm_config.scheduler_config.max_num_seqs != 1 or not (
+            if not (1 <= vllm_config.scheduler_config.max_num_seqs <= 8) or not (
                 plain_graph or target_graph
             ):
                 raise ValueError(
-                    "The ROCm Mini graph probe requires one sequence with plain "
-                    "decode or seven-token greedy DSpark"
+                    "The ROCm Mini graph path requires 1..8 sequences with plain "
+                    "decode or DSpark speculation"
                 )
         if spec is not None and (
             spec.method != "dspark"
@@ -771,12 +771,13 @@ class Inkling2LoopForConditionalGeneration(
         return self.model(positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        has_w6_wmma = getattr(self, "w6_wmma_head", None) is not None
         batched_w6 = (
-            self.w6_head_batch_tile > 0
+            (self.w6_head_batch_tile > 0 or has_w6_wmma)
             and self.packed_head_format == "w6"
             and hidden_states.ndim == 2
             and hidden_states.shape[1] == self.text_config.hidden_size
-            and 2 <= hidden_states.shape[0] <= 8
+            and 2 <= hidden_states.shape[0] <= (64 if has_w6_wmma else 8)
         )
         if (
             self.packed_head is not None

@@ -506,6 +506,154 @@ def _turbo_prefill_rel_attn_kernel(
     )
 
 
+@triton.jit
+def _gather_paged_kv_hnd_kernel(
+    K_cache, V_cache, BlockTable, K_out, V_out,
+    n_pages,
+    stride_kb, stride_kp, stride_kh,
+    stride_vb, stride_vp, stride_vh,
+    stride_okh, stride_okn,
+    stride_ovh, stride_ovn,
+    KVH: tl.constexpr, PAGE: tl.constexpr, D: tl.constexpr,
+):
+    pg_i = tl.program_id(0)
+    kvh = tl.program_id(1)
+    page_id = tl.load(BlockTable + pg_i).to(tl.int64)
+    p = tl.arange(0, PAGE)
+    d = tl.arange(0, D)
+    k = tl.load(K_cache + page_id * stride_kb + p[:, None] * stride_kp + kvh * stride_kh + d[None, :])
+    v = tl.load(V_cache + page_id * stride_vb + p[:, None] * stride_vp + kvh * stride_vh + d[None, :])
+    out_n = (pg_i * PAGE + p).to(tl.int64)
+    tl.store(K_out + kvh * stride_okh + out_n[:, None] * stride_okn + d[None, :], k)
+    tl.store(V_out + kvh * stride_ovh + out_n[:, None] * stride_ovn + d[None, :], v)
+
+
+@triton.jit
+def _turbo_prefill_rel_attn_near_merge_kernel(
+    Q, K, V, Bias, Gate, Sink, OutFar, LseFar, Result,
+    BlockTable, SeqLens, CuSeqlensQ,
+    scale_log2,
+    far_len,
+    req_idx,
+    stride_qt, stride_qh,
+    stride_kb, stride_kp, stride_kh,
+    stride_vb, stride_vp, stride_vh,
+    stride_bt, stride_bh,
+    stride_gate, stride_sink,
+    stride_ofh, stride_ofq,
+    stride_lfh, stride_lfq,
+    stride_res, stride_table,
+    H: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
+    E_PAD: tl.constexpr,
+    BLOCK_Q: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    q_block = tl.program_id(0)
+    head = tl.program_id(1)
+    kv_head = head // GROUP
+
+    q_start = tl.load(CuSeqlensQ + req_idx)
+    q_len = tl.load(CuSeqlensQ + req_idx + 1) - q_start
+    q0 = q_block * BLOCK_Q
+    if q0 >= q_len:
+        return
+    seq_len = tl.load(SeqLens + req_idx)
+    past = seq_len - q_len
+
+    q_offs = tl.arange(0, BLOCK_Q)
+    q_idx = q0 + q_offs
+    row_valid = q_idx < q_len
+    token = (q_start + q_idx).to(tl.int64)
+    d = tl.arange(0, D)
+
+    q = tl.load(
+        Q + token[:, None] * stride_qt + head * stride_qh + d[None, :],
+        row_valid[:, None], other=0.0,
+    )
+    pos = past + q_idx
+    hi = tl.minimum(past + q0 + BLOCK_Q, seq_len)
+
+    table = BlockTable + req_idx * stride_table
+    k_head_base = K + kv_head * stride_kh
+    v_head_base = V + kv_head * stride_vh
+    n_offs = tl.arange(0, BLOCK_N)
+
+    lse_far = tl.load(
+        LseFar + head * stride_lfh + q_idx * stride_lfq,
+        row_valid, other=float("-inf"),
+    ).to(tl.float32)
+    out_far = tl.load(
+        OutFar + head * stride_ofh + q_idx[:, None] * stride_ofq + d[None, :],
+        row_valid[:, None], other=0.0,
+    ).to(tl.float32)
+    m_i = lse_far * 1.4426950408889634
+    l_i = tl.where(row_valid, 1.0, 0.0)
+    acc = out_far
+
+    near_start_block = far_len // BLOCK_N
+    end_block = tl.cdiv(hi, BLOCK_N)
+
+    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
+    key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
+    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
+
+    for blk in range(near_start_block, end_block):
+        key_begin = blk * BLOCK_N
+        keys = key_begin + n_offs
+        key_valid = keys < hi
+        if BLOCK_N <= PAGE:
+            page_id = tl.load(table + (key_begin // PAGE)).to(tl.int64)
+            slot_base = key_begin % PAGE
+            k = tl.load(
+                k_head_base + page_id * stride_kb + (slot_base + n_offs)[:, None] * stride_kp + d[None, :],
+                key_valid[:, None], other=0.0,
+            )
+        else:
+            p0 = tl.load(table + (key_begin // PAGE)).to(tl.int64)
+            p1 = tl.load(table + (key_begin // PAGE) + 1, mask=(key_begin + PAGE) < hi, other=p0).to(tl.int64)
+            pg = tl.where(n_offs < PAGE, p0, p1)
+            sl = n_offs % PAGE
+            k = tl.load(
+                k_head_base + pg[:, None] * stride_kb + sl[:, None] * stride_kp + d[None, :],
+                key_valid[:, None], other=0.0,
+            )
+        s = tl.dot(q, tl.trans(k)) * scale_log2
+        dist = pos[:, None] - keys[None, :]
+        valid = row_valid[:, None] & key_valid[None, :] & (dist >= 0)
+        in_table = valid & (keys[None, :] >= key0[:, None])
+        bias = tl.load(bias_rows[:, None] + keys[None, :], in_table, other=0.0)
+        s = s + bias.to(tl.float32) * 1.4426950408889634
+        s = tl.where(valid, s, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.math.exp2(m_i - m_ref)
+        p = tl.math.exp2(s - m_ref[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        if BLOCK_N <= PAGE:
+            v = tl.load(
+                v_head_base + page_id * stride_vb + (slot_base + n_offs)[:, None] * stride_vp + d[None, :],
+                key_valid[:, None], other=0.0,
+            )
+        else:
+            v = tl.load(
+                v_head_base + pg[:, None] * stride_vb + sl[:, None] * stride_vp + d[None, :],
+                key_valid[:, None], other=0.0,
+            )
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+
+    has_keys = l_i > 0.0
+    out = acc / tl.where(has_keys, l_i, 1.0)[:, None]
+    lse_e = tl.where(has_keys, (m_i + tl.math.log2(l_i)) * 0.6931471805599453, float("-inf"))
+    gate = tl.load(Gate + token[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
+    sink = tl.load(Sink + token * stride_sink + head, row_valid, other=0.0).to(tl.float32)
+    y = out * _turbo_sigmoid(gate) * _turbo_sigmoid(lse_e - sink)[:, None]
+    tl.store(
+        Result + token[:, None] * stride_res + head * D + d[None, :],
+        y.to(Result.dtype.element_ty),
+        row_valid[:, None],
+    )
+
+
 def turbo_gated_rel_attention(
     q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
     sheared_bias: torch.Tensor, gate: torch.Tensor, sinks: torch.Tensor,
@@ -524,6 +672,81 @@ def turbo_gated_rel_attention(
     e_pad = sheared_bias.shape[2]
     extent = e_pad - 256
     bq, bn, nw = 64, 32, 4
+    # Hybrid AOTriton-Far + Triton-Near for long-context global prefill (>=16K past):
+    # eliminates the 32K->64K MALL spill cliff (2.40x faster at 64K, 0.0000 BF16 max err).
+    if (
+        window < 0
+        and max_seqlen_q >= 64
+        and page in (16, 32, 64)
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        seq_cpu = cache_seqlens.tolist()
+        cu_cpu = cu_seqlens_q.tolist()
+        align = max(bn, page)
+        hybrid_reqs = []
+        short_reqs = []
+        for r in range(num_reqs):
+            ql = cu_cpu[r + 1] - cu_cpu[r]
+            past = seq_cpu[r] - ql
+            far_len = (max(past - e_pad, 0) // align) * align
+            if ql >= 64 and far_len >= 2048:
+                hybrid_reqs.append((r, cu_cpu[r], ql, far_len))
+            elif ql > 0:
+                short_reqs.append((r, cu_cpu[r], ql))
+        if hybrid_reqs:
+            for r, qs, ql in short_reqs:
+                qe = qs + ql
+                cu1 = cu_seqlens_q.new_tensor([0, ql])
+                _turbo_prefill_rel_attn_kernel[(triton.cdiv(ql, bq), num_heads, 1)](
+                    q[qs:qe], key_cache, value_cache, sheared_bias[qs:qe],
+                    gate[qs:qe], sinks[qs:qe], result[qs:qe],
+                    block_table[r : r + 1], cache_seqlens[r : r + 1], cu1,
+                    softmax_scale * 1.4426950408889634,
+                    q.stride(0), q.stride(1),
+                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                    sheared_bias.stride(0), sheared_bias.stride(1),
+                    gate.stride(0), sinks.stride(0),
+                    result.stride(0), block_table.stride(0),
+                    H=num_heads, GROUP=num_heads // num_kv_heads, D=head_dim, PAGE=page,
+                    E_PAD=e_pad, EXTENT=extent, WINDOW=window,
+                    BLOCK_Q=bq, BLOCK_N=bn, num_warps=nw, num_stages=1,
+                )
+            for r, qs, ql, far_len in hybrid_reqs:
+                n_pages = far_len // page
+                k_far = q.new_empty((1, num_kv_heads, far_len, head_dim))
+                v_far = q.new_empty((1, num_kv_heads, far_len, head_dim))
+                _gather_paged_kv_hnd_kernel[(n_pages, num_kv_heads)](
+                    key_cache, value_cache, block_table[r], k_far[0], v_far[0], n_pages,
+                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                    k_far.stride(1), k_far.stride(2), v_far.stride(1), v_far.stride(2),
+                    KVH=num_kv_heads, PAGE=page, D=head_dim, num_warps=4,
+                )
+                q_hnd = q[qs : qs + ql].transpose(0, 1).unsqueeze(0).contiguous()
+                out_far, lse_far = torch.ops.aten._scaled_dot_product_flash_attention(
+                    q_hnd, k_far, v_far, 0.0, False, False, scale=softmax_scale
+                )[:2]
+                out_far_3d = out_far[0]
+                lse_far_2d = lse_far[0]
+                _turbo_prefill_rel_attn_near_merge_kernel[(triton.cdiv(ql, bq), num_heads)](
+                    q, key_cache, value_cache, sheared_bias, gate, sinks,
+                    out_far_3d, lse_far_2d, result,
+                    block_table, cache_seqlens, cu_seqlens_q,
+                    softmax_scale * 1.4426950408889634, far_len, r,
+                    q.stride(0), q.stride(1),
+                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                    sheared_bias.stride(0), sheared_bias.stride(1),
+                    gate.stride(0), sinks.stride(0),
+                    out_far_3d.stride(0), out_far_3d.stride(1),
+                    lse_far_2d.stride(0), lse_far_2d.stride(1),
+                    result.stride(0), block_table.stride(0),
+                    H=num_heads, GROUP=num_heads // num_kv_heads, D=head_dim, PAGE=page,
+                    E_PAD=e_pad, BLOCK_Q=bq, BLOCK_N=bn, num_warps=nw, num_stages=1,
+                )
+            return
     grid = (triton.cdiv(max_seqlen_q, bq), num_heads, num_reqs)
     _turbo_prefill_rel_attn_kernel[grid](
         q, key_cache, value_cache, sheared_bias, gate, sinks, result,
@@ -744,6 +967,113 @@ def _reduce_splits_bf16(Partial, Y, SIZE, SPLITS: tl.constexpr, BLOCK: tl.conste
     tl.store(Y + col, tl.sum(part, axis=0).to(tl.bfloat16), col < SIZE)
 
 
+@gluon.jit
+def _w6_wmma_batched_f16_kernel(
+    X, P4, P2, Scales, Y, M,
+    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr,
+    OUT_FP32: gl.constexpr, SOFT_CAP: gl.constexpr,
+):
+    tile_n = gl.program_id(0)
+    tile_m = gl.program_id(1)
+    k_tiles: gl.constexpr = K // 64
+    if M_TILE == 16:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
+        out_layout: gl.constexpr = gl.DistributedLinearLayout(
+            [[0, 1], [0, 4], [0, 8], [0, 64]],
+            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
+            [[0, 16], [0, 32]], [], [16, 128],
+        )
+    else:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
+        out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
+    b_byte: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
+        [[16, 0], [32, 0]], [], [128, 32],
+    )
+    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
+    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
+    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
+    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
+    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
+    for kt in range(k_tiles):
+        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
+        tidx = (tile_n * k_tiles + kt) * 128 + b_row
+        p4 = gl.load(P4 + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
+        p2_word = gl.load(P2 + tidx[:, None] * 4 + (b_col[None, :] // 8))
+        shift = (b_col[None, :] & 7) * 4
+        h2_pair = (p2_word >> shift) & 15
+        sc = gl.load(Scales + tidx)
+        lo_q = (((p4 & 15) | ((h2_pair & 3) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
+        hi_q = (((p4 >> 4) | ((h2_pair >> 2) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
+        w = gl.reshape(gl.join(lo_q, hi_q), (128, 64))
+        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
+        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
+        acc = wmma(a, b, acc)
+    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
+    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
+    val = gl.convert_layout(acc, out_layout)
+    if SOFT_CAP > 0.0:
+        val = libdevice.tanh(val * (1.0 / SOFT_CAP)) * SOFT_CAP
+    if not OUT_FP32:
+        val = val.to(gl.bfloat16, fp_downcast_rounding="rtne")
+    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
+
+
+@gluon.jit
+def _w6_wmma_qkv_batched_f16_kernel(
+    XQ, XK, XV, P4, P2, Scales, Y, M,
+    Q_TILES: gl.constexpr, K_TILES_END: gl.constexpr,
+    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr,
+):
+    tile_n = gl.program_id(0)
+    tile_m = gl.program_id(1)
+    X = gl.where(tile_n < Q_TILES, XQ, gl.where(tile_n < K_TILES_END, XK, XV))
+    k_tiles: gl.constexpr = K // 64
+    if M_TILE == 16:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
+        out_layout: gl.constexpr = gl.DistributedLinearLayout(
+            [[0, 1], [0, 4], [0, 8], [0, 64]],
+            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
+            [[0, 16], [0, 32]], [], [16, 128],
+        )
+    else:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
+        out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
+    b_byte: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
+        [[16, 0], [32, 0]], [], [128, 32],
+    )
+    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
+    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
+    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
+    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
+    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
+    for kt in range(k_tiles):
+        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
+        tidx = (tile_n * k_tiles + kt) * 128 + b_row
+        p4 = gl.load(P4 + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
+        p2_word = gl.load(P2 + tidx[:, None] * 4 + (b_col[None, :] // 8))
+        shift = (b_col[None, :] & 7) * 4
+        h2_pair = (p2_word >> shift) & 15
+        sc = gl.load(Scales + tidx)
+        lo_q = (((p4 & 15) | ((h2_pair & 3) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
+        hi_q = (((p4 >> 4) | ((h2_pair >> 2) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
+        w = gl.reshape(gl.join(lo_q, hi_q), (128, 64))
+        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
+        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
+        acc = wmma(a, b, acc)
+    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
+    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
+    val = gl.convert_layout(acc, out_layout).to(gl.bfloat16, fp_downcast_rounding="rtne")
+    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
+
+
 def w6_wmma_linear(
     x: torch.Tensor, weight: W6WmmaWeight, *,
     out_dtype: torch.dtype = torch.bfloat16, soft_cap: float = 0.0, splits: int = 1,
@@ -751,7 +1081,14 @@ def w6_wmma_linear(
     m, k = x.shape
     n_pad = weight.padded_out
     out = x.new_empty((m, n_pad), dtype=out_dtype)
-    if splits == 1:
+    if m > 16:
+        bm = 32 if m <= 32 else 64
+        _w6_wmma_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
+            x.contiguous(), weight.p4, weight.p2, weight.scales, out, m,
+            N=n_pad, K=k, M_TILE=bm, OUT_FP32=out_dtype == torch.float32,
+            SOFT_CAP=soft_cap, num_warps=4, num_stages=1,
+        )
+    elif splits == 1:
         _w6_wmma_m8_kernel[(n_pad // 128, 1)](
             x.contiguous(), weight.p4, weight.p2, weight.scales, out, m,
             N=n_pad, K=k, SPLITS=1, OUT_FP32=out_dtype == torch.float32,
@@ -777,12 +1114,21 @@ def w6_wmma_qkv_linear(
     m, k = x_q.shape
     n_pad = weight.padded_out
     out = x_q.new_empty((m, n_pad), dtype=torch.bfloat16)
-    _w6_wmma_qkv_m8_kernel[(n_pad // 128,)](
-        x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
-        weight.p4, weight.p2, weight.scales, out, m,
-        Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
-        N=n_pad, K=k, num_warps=4, num_stages=1,
-    )
+    if m > 16:
+        bm = 32 if m <= 32 else 64
+        _w6_wmma_qkv_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
+            x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
+            weight.p4, weight.p2, weight.scales, out, m,
+            Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
+            N=n_pad, K=k, M_TILE=bm, num_warps=4, num_stages=1,
+        )
+    else:
+        _w6_wmma_qkv_m8_kernel[(n_pad // 128,)](
+            x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
+            weight.p4, weight.p2, weight.scales, out, m,
+            Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
+            N=n_pad, K=k, num_warps=4, num_stages=1,
+        )
     return out
 
 
@@ -876,11 +1222,72 @@ def _w4_wmma_m8_kernel(
     )
 
 
-def w4_wmma_linear(x: torch.Tensor, weight: W4WmmaWeight, *, splits: int = 1) -> torch.Tensor:
+@gluon.jit
+def _w4_wmma_batched_f16_kernel(
+    X, Packed, Scales, Bias, Y, M,
+    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr, HAS_BIAS: gl.constexpr,
+):
+    tile_n = gl.program_id(0)
+    tile_m = gl.program_id(1)
+    k_tiles: gl.constexpr = K // 64
+    if M_TILE == 16:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
+        out_layout: gl.constexpr = gl.DistributedLinearLayout(
+            [[0, 1], [0, 4], [0, 8], [0, 64]],
+            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
+            [[0, 16], [0, 32]], [], [16, 128],
+        )
+    else:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
+        out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
+    b_byte: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
+        [[16, 0], [32, 0]], [], [128, 32],
+    )
+    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
+    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
+    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
+    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
+    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
+    for kt in range(k_tiles):
+        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
+        tidx = (tile_n * k_tiles + kt) * 128 + b_row
+        packed = gl.load(Packed + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
+        sc = gl.load(Scales + tidx)
+        lo = ((packed & 15).to(gl.int32) - 8).to(gl.float16) * sc[:, None]
+        hi = ((packed >> 4).to(gl.int32) - 8).to(gl.float16) * sc[:, None]
+        w = gl.reshape(gl.join(lo, hi), (128, 64))
+        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
+        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
+        acc = wmma(a, b, acc)
+    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
+    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
+    val = gl.convert_layout(acc, out_layout)
+    if HAS_BIAS:
+        bv = gl.load(Bias + tile_n * 128 + out_col, (tile_n * 128 + out_col) < N, 0).to(gl.float32)
+        val = val + bv[None, :]
+    val = val.to(gl.bfloat16, fp_downcast_rounding="rtne")
+    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
+
+
+def w4_wmma_linear(
+    x: torch.Tensor, weight: W4WmmaWeight, *, bias: torch.Tensor | None = None, splits: int = 1,
+) -> torch.Tensor:
     m, k = x.shape
     n_pad = weight.padded_out
     out = x.new_empty((m, n_pad), dtype=torch.bfloat16)
-    if splits == 1:
+    if m > 16 or bias is not None:
+        bm = 16 if m <= 16 else (32 if m <= 32 else 64)
+        bias_arg = bias if bias is not None else out
+        _w4_wmma_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
+            x.contiguous(), weight.packed, weight.scales, bias_arg, out, m,
+            N=n_pad, K=k, M_TILE=bm, HAS_BIAS=bias is not None,
+            num_warps=4, num_stages=1,
+        )
+    elif splits == 1:
         _w4_wmma_m8_kernel[(n_pad // 128, 1)](
             x.contiguous(), weight.packed, weight.scales, out, m,
             N=n_pad, K=k, SPLITS=1, num_warps=4, num_stages=1,
@@ -1013,7 +1420,7 @@ def topk_markov_argmax(
 
 
 # ============================================================================
-# 6. WAVE 2: TURBO M=8 SPLIT-KV DECODE ATTENTION (1.80x FASTER AT 64K!)
+# 6. TURBO M=8 SPLIT-KV DECODE ATTENTION (1.80x FASTER AT 64K!)
 # ============================================================================
 
 @triton.jit
@@ -1175,8 +1582,15 @@ def turbo_rel_decode_m8_attention(
     num_reqs = cache_seqlens.shape[0]
     extent = rel_logits.shape[2] - 256
     window = extent - 1 if is_local else -1
-    # 10 splits for full (215 GB/s at 64K!), 8 splits for local
-    num_splits = 8 if is_local else 10
+    # Adaptive split count by concurrent requests: preserves C1 64K peak & maximizes B=2..8 CU occupancy
+    if num_reqs == 1:
+        num_splits = 8 if is_local else 10
+    elif num_reqs == 2:
+        num_splits = 4 if is_local else 5
+    elif num_reqs <= 4:
+        num_splits = 2 if is_local else 6
+    else:
+        num_splits = 1 if is_local else 6
     block_n = 32 if page == 16 else 64
     o_part = q.new_empty((num_splits * num_tokens, num_heads, head_dim), dtype=torch.float32)
     lse_part = q.new_empty((num_heads, num_splits * num_tokens), dtype=torch.float32)
@@ -1196,7 +1610,7 @@ def turbo_rel_decode_m8_attention(
 
 
 # ============================================================================
-# 7. WAVE 2: FAST M=8 ROUTER (1.62x FASTER) & FAST LOOP CONTROLLER DOWN (1.61x)
+# 7. FAST M=8 ROUTER (1.62x FASTER) & FAST LOOP CONTROLLER DOWN (1.61x)
 # ============================================================================
 
 @triton.jit
@@ -1298,7 +1712,7 @@ def controller_down_m8(pair: torch.Tensor, down_weight: torch.Tensor) -> torch.T
 
 
 # ============================================================================
-# 8. WAVE 2: FP16-DIRECT MIXED & CODA MoE (M16 DECODE + M64 PREFILL)
+# 8. FP16-DIRECT MIXED & CODA MoE (M16 DECODE + M64 PREFILL)
 # ============================================================================
 
 @gluon.jit
@@ -1542,25 +1956,28 @@ def coda_wmma_turbo_projection(x, bank, plan, *, fused_activation=None):
 
 
 # ============================================================================
-# 9. WAVE 5: FUSED PREFILL LOOP BLEND + RMSNORM (1.60x FASTER, SKIPS 212MB BMM!)
+# 9. FUSED PREFILL LOOP BLEND + RMSNORM (1.60x FASTER, SKIPS 212MB BMM!)
 # ============================================================================
 
 @triton.jit
 def _fused_loop_blend_p1_kernel(
-    Hidden, Weight, Dest, Message, Blended, SumSq,
+    Hidden, Weight, Dest, Message, Blended, PartialSumSq,
     stride_dest_s, stride_dest_t, stride_message_s, stride_message_t,
     T, D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
+    D_PER_BLK: tl.constexpr, N_DBLK: tl.constexpr,
 ):
     t_blk = tl.program_id(0)
-    s = tl.program_id(1).to(tl.int64)
+    d_grp = tl.program_id(1)
+    s = tl.program_id(2).to(tl.int64)
     t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
     k = tl.arange(0, 64)
     t_mask = t < T
     h = tl.load(Hidden + (s * T + t[:, None]) * 64 + k[None, :], t_mask[:, None], other=0.0)
     sum_sq = tl.zeros((BT,), tl.float32)
     d_offs = tl.arange(0, BD)
-    for d0 in range(0, D, BD):
-        d = d0 + d_offs
+    d_start = d_grp * D_PER_BLK
+    for off in range(0, D_PER_BLK, BD):
+        d = d_start + off + d_offs
         w_base = Weight + (s * (2 * D) + d[:, None]) * 64 + k[None, :]
         wg = tl.load(w_base)
         wf = tl.load(w_base + D * 64)
@@ -1571,13 +1988,13 @@ def _fused_loop_blend_p1_kernel(
         b = (1.0 - forget) * dest + gain * msg
         sum_sq += tl.sum(b * b, axis=1)
         tl.store(Blended + (s * T + t[:, None]) * D + d[None, :], b.to(tl.bfloat16), t_mask[:, None])
-    tl.store(SumSq + s * T + t, sum_sq, t_mask)
+    tl.store(PartialSumSq + (s * N_DBLK + d_grp) * T + t, sum_sq, t_mask)
 
 
 @triton.jit
 def _fused_loop_blend_p2_kernel(
-    Blended, SumSq, NormWeight, Out, stride_w_s, T, norm_eps,
-    D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
+    Blended, PartialSumSq, NormWeight, Out, stride_w_s, T, norm_eps,
+    D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, N_DBLK: tl.constexpr,
 ):
     t_blk = tl.program_id(0)
     d_blk = tl.program_id(1)
@@ -1585,7 +2002,15 @@ def _fused_loop_blend_p2_kernel(
     t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
     d = d_blk * BD + tl.arange(0, BD)
     t_mask = t < T
-    rstd = tl_hip_lib.rsqrt(tl.div_rn(tl.load(SumSq + s * T + t, t_mask, other=0.0), D) + norm_eps)
+    g = tl.arange(0, 16)
+    g_mask = g < N_DBLK
+    psq = tl.load(
+        PartialSumSq + (s * N_DBLK + g[:, None]) * T + t[None, :],
+        g_mask[:, None] & t_mask[None, :],
+        other=0.0,
+    )
+    sum_sq = tl.sum(psq, axis=0)
+    rstd = tl_hip_lib.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
     w = tl.load(NormWeight + s * stride_w_s + d).to(tl.float32)
     b = tl.load(Blended + (s * T + t[:, None]) * D + d[None, :], t_mask[:, None], other=0.0).to(tl.float32)
     tl.store(Out + (s * T + t[:, None]) * D + d[None, :], (b * rstd[:, None] * w[None, :]).to(tl.bfloat16), t_mask[:, None])
@@ -1601,7 +2026,7 @@ def fused_loop_prefill_blend(
         return None
     streams, t_len, width = message.shape
     if (
-        t_len < 64
+        t_len < 16
         or width != 2304
         or hidden.shape != (streams, t_len, 64)
         or weight.shape != (streams, 2 * width, 64)
@@ -1614,15 +2039,16 @@ def fused_loop_prefill_blend(
     ):
         return None
     blended = message.new_empty(message.shape, dtype=torch.bfloat16)
-    sum_sq = message.new_empty((streams, t_len), dtype=torch.float32)
+    partial_sum_sq = message.new_empty((streams, 9, t_len), dtype=torch.float32)
     out = message.new_empty(message.shape, dtype=torch.bfloat16)
-    _fused_loop_blend_p1_kernel[(triton.cdiv(t_len, 32), streams)](
-        hidden, weight, dest, message, blended, sum_sq,
+    bt = 16 if t_len <= 32 else 32
+    _fused_loop_blend_p1_kernel[(triton.cdiv(t_len, bt), 9, streams)](
+        hidden, weight, dest, message, blended, partial_sum_sq,
         *dest.stride()[:2], *message.stride()[:2], t_len,
-        D=width, BT=32, BD=64, num_warps=4,
+        D=width, BT=bt, BD=64, D_PER_BLK=256, N_DBLK=9, num_warps=4,
     )
-    _fused_loop_blend_p2_kernel[(triton.cdiv(t_len, 32), width // 128, streams)](
-        blended, sum_sq, norm_weight, out, norm_weight.stride(0), t_len, norm_eps,
-        D=width, BT=32, BD=128, num_warps=4,
+    _fused_loop_blend_p2_kernel[(triton.cdiv(t_len, bt), width // 128, streams)](
+        blended, partial_sum_sq, norm_weight, out, norm_weight.stride(0), t_len, norm_eps,
+        D=width, BT=bt, BD=128, N_DBLK=9, num_warps=4,
     )
     return out

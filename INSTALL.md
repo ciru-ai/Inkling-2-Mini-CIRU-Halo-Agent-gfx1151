@@ -42,7 +42,7 @@ The last command should display a HIP version and an architecture beginning with
 ```bash
 git clone https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151.git
 cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
-INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.2.2"
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.3.0"
 INKLING_MODEL="$HOME/models/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151"
 
 bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
@@ -50,11 +50,24 @@ bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
   --prefix "$INKLING_ROOT" --download-model "$INKLING_MODEL"
 ```
 
-The installer verifies the package and model checksums, retrieves the pinned [vLLM runtime](https://github.com/ciru-ai/vllm/commit/7c4aa8b5b1d9aed94f4bfadcc38593a1f782066a) and [Transformers support](https://github.com/huggingface/transformers/commit/6173a2f679ff4ed393afc499aefc569da7e68bc1), and links the ROCm extensions into the standalone prefix. The launcher reuses the virtual environment. If you already have the complete [Hugging Face bundle](https://huggingface.co/jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151), omit `--download-model` and point the launcher at your copy.
+The installer verifies the package and model checksums, retrieves the pinned [vLLM runtime](https://github.com/ciru-ai/vllm/commit/c95dbfa9cf4e6cbe94f9691e9febc868a217ecd7) and [Transformers support](https://github.com/huggingface/transformers/commit/6173a2f679ff4ed393afc499aefc569da7e68bc1), and links the ROCm extensions into the standalone prefix. The launcher reuses the virtual environment. If you already have the complete [Hugging Face bundle](https://huggingface.co/jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151), omit `--download-model` and point the launcher at your copy.
 
 You can also run `bash scripts/install.sh` from the root of the complete Hugging Face download.
 
-When upgrading an existing clone, run `git fetch origin --tags` and `git switch --detach v1.2.2`. Use the new install prefix above and omit `--download-model` to reuse the checkpoint files already on disk. Stop the previous server and start the new prefix's `serve.sh` to apply the idle CPU fix.
+### Upgrading from v1.2.x to v1.3.0
+
+Your existing model and fitted weight files (`WEIGHTS.sha256`) are unchanged and do not need to be re-downloaded. Update the runtime repo, install into the new prefix, and restart the server:
+
+```bash
+cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
+git fetch origin --tags
+git switch --detach v1.3.0
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.3.0"
+
+bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
+  --transformers-deps "$HOME/.local/share/inkling-halo/transformers-deps" \
+  --prefix "$INKLING_ROOT"
+```
 
 Use `bash scripts/install.sh --verify-only` to check package integrity without downloading or installing anything. Add `--venv "$HOME/.venvs/inkling-halo"` to check the wheel versions and ROCm extension. Add `--transformers-deps "$HOME/.local/share/inkling-halo/transformers-deps"` with that virtual environment to verify the isolated dependencies.
 
@@ -84,15 +97,25 @@ Set `--context` to override the request limit. The launcher sizes the KV pool fr
 "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --context 32768 --kv-mib 24576 --tools
 ```
 
-### Serve images
+### Serve concurrent agents (adaptive single-stream and 8-way throughput)
 
-Start the vision preset. It also defaults to 1,048,576 tokens, including image tokens. It accepts up to eight active sequences sharing one 52 GiB BF16 KV cache. The original checkpoint contains the vision encoder weights.
+Version 1.3.0 upgrades `--mode concurrent` with multi-request FULL Target + Draft HIP graphs (`1..8` active sequences), batched W6/W4/WMMA projections, and dual-depth adaptive DSpark speculation (`K=7` for a single active request, switching automatically to `K=4` for 2–8 concurrent requests):
 
 ```bash
-"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode vision
+"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode concurrent --tools
 ```
 
-For a first check, use a small local PNG or JPEG such as 512 × 512. The example sends the image and a text question in one request. Add `--tools` to the launch command if your client sends tool definitions.
+Pass `--context 32768 --prefix-cache` for a compact 24 GiB KV pool, `--spec-tokens 4` to fix a four-token draft depth across all batch sizes, or `--vision` to enable image input alongside greedy concurrent serving.
+
+### Serve images and multi-agent vision workflows
+
+Start the `vision` preset. In v1.3.0, it runs with FULL Target + Draft HIP graphs (`1..8` sequences), four-token probabilistic DSpark speculation (`K=4`), prefix caching, and the default 1,048,576-token window (52 GiB BF16 KV cache):
+
+```bash
+"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode vision --tools
+```
+
+For a first check, use a small local PNG or JPEG such as 512 × 512. The example sends the image and a text question in one request.
 
 ```bash
 python3 - ./example.png <<'PYTHON'
@@ -130,20 +153,20 @@ with urlopen(request, timeout=120) as response:
 PYTHON
 ```
 
-### Serve a 64K prompt
+### Serve long prompts (32K–64K+ with hybrid global prefill)
 
 ```bash
 "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode long-context --context 66048 --tools
 ```
 
-This example matches the 64K benchmark with 66,048 total tokens and a 28 GiB BF16 KV pool. It uses both sets of fitted weights.
+Version 1.3.0 routes global far-history prefill (`>= 2,048` far tokens) through native ROCm AOTriton FlashAttention-2 with an online-softmax near-window merge, eliminating the 64K prefill cliff (`+61.6%` faster at 62K–64K prompts) and improving 64K decode split-KV memory bandwidth. This example matches the 64K benchmark with 66,048 total tokens and a 28 GiB BF16 KV pool.
 
-### Serve eight requests
+### Serve sampling (`T > 0`) workloads
 
 ```bash
-"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode concurrent --context 4096 --tools
+"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode sampling --seqs 8 --context 32768 --prefix-cache --tools
 ```
 
-This example matches the measured eight-request run with a 4,096-token request limit, a shared 6 GiB BF16 KV pool, and the fitted routed experts.
+Uses probabilistic DSpark (`K=4`) with FULL Target + Draft HIP graphs for temperature-sampled generation across 1–8 sequences.
 
-Pass `--original-weights` to use the original checkpoint files with the AMD runtime. The published highlights using fitted weights assume the default behavior.
+Pass `--original-weights` to use only the original Thinking Machines Lab checkpoint files without the fitted weight banks. Pass `--no-graphs` to fall back to eager execution if needed for debugging.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Portable launcher for Inkling 2 Mini CIRU Halo Agent (gfx1151).
+# Portable launcher for Inkling 2 Mini CIRU Halo Agent (gfx1151) v1.3.0.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -13,11 +13,11 @@ Required:
   --model PATH            Local directory downloaded from the release on Hugging Face
 
 Modes & Serving Options:
-  --mode MODE             single (default, single-stream HIP graph),
-                          long-context (single-stream HIP graph),
-                          concurrent (eager greedy DSpark, 8 sequences),
-                          sampling (eager probabilistic DSpark),
-                          vision (image and text input, 8 sequences)
+  --mode MODE             single (default, single-stream FULL HIP graph, DSpark K=7),
+                          long-context (single-stream FULL HIP graph, hybrid 64K+ global prefill),
+                          concurrent (multi-agent FULL Target+Draft HIP graphs, adaptive K=7@B=1 / K=4@B=2..8, 8 sequences),
+                          sampling (probabilistic DSpark K=4 with FULL Target+Draft HIP graphs),
+                          vision (image and text input, probabilistic DSpark K=4 with FULL Target+Draft HIP graphs, 8 sequences)
   --served-model-name ID  OpenAI API model name (default: main)
   --host HOST             Bind host (default: 127.0.0.1)
   --port PORT             Bind port (default: 18753)
@@ -26,23 +26,28 @@ Modes & Serving Options:
   --batch-tokens N        Scheduler max_num_batched_tokens (default: 4096)
   --prefill-chunk-tokens N
                           Optional --long-prefill-token-threshold cap
-  --kv-mib N              BF16 KV cache budget in MiB (default: sized for context)
-  --spec-tokens K         DSpark draft depth 1..7 (default: 7)
+  --kv-mib N              BF16 KV cache budget in MiB (default: sized for context and concurrency)
+  --spec-tokens K         Fixed DSpark draft depth 1..7 (overrides mode default)
+  --adaptive-spec         Enable dual-depth adaptive DSpark HIP graphs (K=7 @ B=1, K=4 @ B=2..N; default in concurrent)
+  --no-adaptive-spec      Disable adaptive depth switching
   --no-spec               Disable DSpark speculative decoding
-  --prefix-cache          Enable vLLM prefix caching (enabled in vision mode)
+  --prefix-cache          Enable vLLM prefix caching (enabled in vision mode by default)
   --tools                 Enable Inkling native auto tool calling
-  --draft-graph           Enable DSpark draft HIP graph (on in single/long-context by default)
+  --vision                Enable native ROCm vision encoder in any mode
+  --language-model-only   Disable vision encoder (default outside vision mode)
+  --draft-graph           Enable DSpark draft HIP graph (default: on when graphs are enabled)
   --no-draft-graph        Disable DSpark draft HIP graph
+  --no-graphs             Disable FULL HIP graph capture (run eager)
 
 Runtime & Optional Quant Bank Paths:
   --python PATH           Python interpreter inside the vLLM 0.34 ROCm 10 environment
                           (auto-detected from INKLING_PYTHON, active VIRTUAL_ENV, or .venv)
   --overlay PATH          Path to the installed vLLM source tree
-  --transformers-src PATH  Path to the pinned Transformers src directory
+  --transformers-src PATH Path to the pinned Transformers src directory
   --transformers-deps PATH
                           Path to the isolated Transformers dependencies
   --triton-cache PATH     Triton kernel cache directory (default: ${XDG_CACHE_HOME:-$HOME/.cache}/inkling-ciru-triton)
-  --original-weights     Use only the original checkpoint files, without fitted weights
+  --original-weights      Use only the original checkpoint files, without fitted weights
   --dry-run               Print resolved environment and command without launching
 EOF
 }
@@ -62,11 +67,15 @@ seqs=
 batch_tokens=4096
 prefill_chunk=
 kv_mib=
-spec_tokens=7
+spec_tokens=
+spec_tokens_set=0
+adaptive_spec=0
 speculation=1
 prefix_cache=0
 tools=0
+vision=auto
 turbo=1
+no_graphs=0
 draft_graph=auto
 python_bin="${INKLING_PYTHON:-}"
 overlay_dir="${INKLING_OVERLAY_DIR:-}"
@@ -97,12 +106,17 @@ while (( $# )); do
         --batch-tokens) batch_tokens="$2"; shift ;;
         --prefill-chunk-tokens) prefill_chunk="$2"; shift ;;
         --kv-mib) kv_mib="$2"; shift ;;
-        --spec-tokens) spec_tokens="$2"; shift ;;
+        --spec-tokens) spec_tokens="$2"; spec_tokens_set=1; shift ;;
+        --adaptive-spec) adaptive_spec=1 ;;
+        --no-adaptive-spec) adaptive_spec=-1 ;;
         --no-spec) speculation=0 ;;
         --prefix-cache) prefix_cache=1 ;;
         --tools) tools=1 ;;
+        --vision) vision=1 ;;
+        --language-model-only) vision=0 ;;
         --draft-graph) draft_graph=1 ;;
         --no-draft-graph) draft_graph=0 ;;
+        --no-graphs) no_graphs=1 ;;
         --python) python_bin="$2"; shift ;;
         --overlay) overlay_dir="$2"; shift ;;
         --transformers-src) transformers_src="$2"; shift ;;
@@ -120,26 +134,30 @@ case "$mode" in
     single|long-context|concurrent|sampling|vision) ;;
     *) die "unsupported mode: $mode (expected single, long-context, concurrent, sampling, or vision)" ;;
 esac
-for number in "$port" "$batch_tokens" "$spec_tokens" ${context:+"$context"} ${seqs:+"$seqs"} ${prefill_chunk:+"$prefill_chunk"} ${kv_mib:+"$kv_mib"}; do
+for number in "$port" "$batch_tokens" ${spec_tokens:+"$spec_tokens"} ${context:+"$context"} ${seqs:+"$seqs"} ${prefill_chunk:+"$prefill_chunk"} ${kv_mib:+"$kv_mib"}; do
     [[ "$number" =~ ^[1-9][0-9]*$ ]] || die "expected a positive number, got $number"
 done
-(( port <= 65535 && spec_tokens <= 7 )) || die 'port must be at most 65535 and draft depth at most 7'
+(( port <= 65535 )) || die 'port must be at most 65535'
+if (( spec_tokens_set )) && (( spec_tokens > 7 )); then
+    die 'draft depth must be at most 7'
+fi
 
 context=${context:-1048576}
 if [[ -z "$seqs" ]]; then
     if [[ "$mode" == concurrent || "$mode" == vision ]]; then seqs=8; else seqs=1; fi
+fi
+if [[ "$vision" == auto ]]; then
+    if [[ "$mode" == vision ]]; then vision=1; else vision=0; fi
 fi
 if (( ! original_weights )) && [[ -d "$model/optimized-weights" ]]; then
     expert_bank="$model/optimized-weights/experts"
     for layer in 6 12 17; do
         [[ -s "$expert_bank/layer$layer.pt" ]] || die "missing fitted expert weights for layer $layer; download the full bundle"
     done
-    if [[ "$mode" == single || "$mode" == long-context || "$mode" == vision ]]; then
-        coda_c1_dir="$model/optimized-weights/final-layers"
-        for layer in 20 21 22 23; do
-            [[ -s "$coda_c1_dir/layer$layer-c1.safetensors" ]] || die "missing fitted final-layer weights for layer $layer; download the full bundle"
-        done
-    fi
+    coda_c1_dir="$model/optimized-weights/final-layers"
+    for layer in 20 21 22 23; do
+        [[ -s "$coda_c1_dir/layer$layer-c1.safetensors" ]] || die "missing fitted final-layer weights for layer $layer; download the full bundle"
+    done
     expert_policy=c1-down
 fi
 
@@ -165,10 +183,27 @@ if [[ -z "$kv_mib" ]]; then
         kv_mib=$((16384 + 36 * ((context + 1023) / 1024)))
     elif [[ "$mode" == long-context && "$context" == 66048 ]]; then
         kv_mib=28672
-    elif [[ "$mode" == vision && "$context" == 32768 ]]; then
+    elif (( seqs > 1 && context > 32768 )); then
+        kv_mib=32768
+    elif (( seqs > 1 && context >= 32768 )); then
         kv_mib=24576
+    elif (( seqs > 1 && context > 4096 )); then
+        kv_mib=10240
     else
         kv_mib=$((6144 * ((context + 16383) / 16384)))
+    fi
+fi
+
+if (( adaptive_spec == 0 && turbo && speculation && !no_graphs && !spec_tokens_set && seqs > 1 )) && [[ "$mode" == concurrent ]]; then
+    adaptive_spec=1
+fi
+if (( adaptive_spec > 0 && seqs > 1 )); then
+    spec_tokens=7
+elif (( ! spec_tokens_set )); then
+    if [[ "$mode" == sampling || "$mode" == vision || "$mode" == concurrent ]]; then
+        spec_tokens=4
+    else
+        spec_tokens=7
     fi
 fi
 
@@ -180,20 +215,37 @@ sample_method=greedy
 experimental_kernels=0
 draft_w8=0
 router_mode=off
+single_seq_dspark=0
+greedy_fused_markov=0
 
 case "$mode" in
     single|long-context)
-        target_graph="$speculation"
-        plain_graph=$((1 - speculation))
+        target_graph=$((speculation && !no_graphs))
+        plain_graph=$((!speculation && !no_graphs))
         verifier_head_tile=$((8 * target_graph))
+        single_seq_dspark="$target_graph"
+        greedy_fused_markov="$target_graph"
         if (( turbo && speculation )); then
             experimental_kernels=1
             draft_w8=all
             router_mode=align
         fi
         ;;
+    concurrent)
+        target_graph=$((speculation && !no_graphs))
+        plain_graph=$((!speculation && !no_graphs))
+        router_mode=align
+        greedy_fused_markov="$target_graph"
+        if (( turbo && target_graph )); then
+            experimental_kernels=1
+            draft_w8=all
+        fi
+        ;;
     sampling|vision)
         sample_method=probabilistic
+        target_graph=$((speculation && !no_graphs))
+        plain_graph=$((!speculation && !no_graphs))
+        router_mode=align
         ;;
 esac
 if [[ "$mode" == vision ]]; then
@@ -204,7 +256,7 @@ if [[ "$mode" == single ]] && (( context <= 4096 && spec_tokens == 7 )); then
     copy_draft="$target_graph"
 fi
 if [[ "$draft_graph" == auto ]]; then
-    if (( turbo && speculation )) && [[ "$mode" == single || "$mode" == long-context ]]; then
+    if (( turbo && target_graph )); then
         draft_graph=1
     else
         draft_graph=0
@@ -280,16 +332,16 @@ settings=(
     INKLING_AMD_SOURCE_WMMA_N_FAST=0
     "INKLING_AMD_DECODE_GRAPH=$plain_graph"
     "INKLING_AMD_DSPARK_TARGET_GRAPH=$target_graph"
-    "INKLING_AMD_SOURCE_WMMA_PRETILE=$target_graph"
-    "INKLING_AMD_CODA_WMMA_PRETILE=$target_graph"
-    "INKLING_AMD_MIXED_WMMA_PRETILE=$target_graph"
+    "INKLING_AMD_SOURCE_WMMA_PRETILE=$((target_graph || turbo))"
+    "INKLING_AMD_CODA_WMMA_PRETILE=$((target_graph || turbo))"
+    "INKLING_AMD_MIXED_WMMA_PRETILE=$((target_graph || turbo))"
     "INKLING_AMD_SOURCE_WMMA_WAVE_EPILOGUE=$target_graph"
     "INKLING_AMD_DSPARK_COPY_DRAFT=$copy_draft"
     "INKLING_AMD_W6_VERIFY_ATTN=$target_graph"
     "INKLING_AMD_W6_HEAD_BATCH_TILE=$verifier_head_tile"
-    "INKLING_AMD_DSPARK_W6_BASE_HEAD=$target_graph"
-    "INKLING_AMD_DSPARK_W8_MARKOV=$target_graph"
-    "INKLING_AMD_DSPARK_MARKOV_FUSED_ARGMAX=$target_graph"
+    "INKLING_AMD_DSPARK_W6_BASE_HEAD=$single_seq_dspark"
+    "INKLING_AMD_DSPARK_W8_MARKOV=$single_seq_dspark"
+    "INKLING_AMD_DSPARK_MARKOV_FUSED_ARGMAX=$greedy_fused_markov"
     "INKLING_AMD_DSPARK_W8_BACKBONE=$draft_w8"
     "INKLING_AMD_FUSED_M8_ROUTER=$router_mode"
     "INKLING_AMD_W6_BATCH_DOT2=$experimental_kernels"
@@ -307,7 +359,7 @@ if [[ -n "$joined_pypath" ]]; then
     settings=("PYTHONPATH=$joined_pypath" "${settings[@]}")
 fi
 input_mode=()
-if [[ "$mode" != vision ]]; then
+if (( ! vision )); then
     input_mode+=(--language-model-only)
 fi
 command=(
@@ -327,32 +379,45 @@ if (( prefix_cache )); then
 else
     command+=(--disable-prefix-caching)
 fi
+cg_req_sizes=$(seq -s, 1 "$seqs")
+if (( adaptive_spec > 0 && seqs > 1 )); then
+    cg_max_toks=$((seqs * 5 > 8 ? seqs * 5 : 8))
+else
+    cg_max_toks=$((seqs * (spec_tokens + 1)))
+fi
 if (( target_graph )); then
     command+=(
         --compilation-config
-        "{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"decode_cudagraph_capture_request_sizes\":[1],\"max_decode_cudagraph_capture_tokens\":$((spec_tokens + 1))}"
+        "{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"decode_cudagraph_capture_request_sizes\":[$cg_req_sizes],\"max_decode_cudagraph_capture_tokens\":$cg_max_toks}"
         --cudagraph-metrics
     )
 elif (( plain_graph )); then
     command+=(
         --compilation-config
-        '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1]}'
+        "{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[$cg_req_sizes]}"
         --cudagraph-metrics
     )
 else
     command+=(--enforce-eager)
 fi
 if (( speculation )); then
-    command+=(
-        --speculative-config
-        "{\"method\":\"dspark\",\"num_speculative_tokens\":$spec_tokens,\"draft_sample_method\":\"$sample_method\"}"
-    )
+    if (( adaptive_spec > 0 && seqs > 1 )); then
+        command+=(
+            --speculative-config
+            "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"num_speculative_tokens_per_batch_size\":[[1,1,7],[2,$seqs,4]],\"draft_sample_method\":\"$sample_method\"}"
+        )
+    else
+        command+=(
+            --speculative-config
+            "{\"method\":\"dspark\",\"num_speculative_tokens\":$spec_tokens,\"draft_sample_method\":\"$sample_method\"}"
+        )
+    fi
 fi
 if (( tools )); then
     command+=(--enable-auto-tool-choice --tool-call-parser inkling)
 fi
 if (( dry_run )); then
-    printf 'Inkling 2 Mini CIRU Halo Agent (%s)\n' "$mode"
+    printf 'Inkling 2 Mini CIRU Halo Agent v1.3.0 (%s, adaptive=%s)\n' "$mode" "$adaptive_spec"
     printf 'Environment:\n'
     printf '  %q\n' "${settings[@]}"
     printf 'Command:\n '
@@ -381,6 +446,6 @@ ciru_use_fixed_rocr "$python_bin" || die 'ROCm idle CPU fix could not be loaded'
 for s in "${settings[@]}"; do
     export "$s"
 done
-printf 'Starting Inkling 2 Mini CIRU Halo Agent, mode=%s context=%s sequences=%s KV memory=%s MiB\n' \
-    "$mode" "$context" "$seqs" "$kv_mib"
+printf 'Starting Inkling 2 Mini CIRU Halo Agent v1.3.0, mode=%s context=%s sequences=%s KV memory=%s MiB adaptive=%s\n' \
+    "$mode" "$context" "$seqs" "$kv_mib" "$adaptive_spec"
 exec "${command[@]}"

@@ -183,12 +183,19 @@ class Inkling2DraftSelfAttention(nn.Module):
             "kv_scale", torch.ones((), dtype=torch.float32), persistent=False
         )
         # Keys a block sees: itself and, if local, the window before it.
+        self._sliding_window_size = config.sliding_window_size
         self.window = config.sliding_window_size + self.block if is_local else 0
         vllm_config = get_current_vllm_config()
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        for b in range(2, config.draft_block_size + 1):
+            self.register_buffer(
+                f"_cu_seqlens_b{b}",
+                torch.arange(max_num_seqs + 1, dtype=torch.int32) * b,
+                persistent=False,
+            )
         self.register_buffer(
             "cu_seqlens_q",
-            torch.arange(max_num_seqs + 1, dtype=torch.int32) * self.block,
+            getattr(self, f"_cu_seqlens_b{self.block}"),
             persistent=False,
         )
 
@@ -320,11 +327,13 @@ class Inkling2DraftMLP(nn.Module):
         self.w4_down = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.w4_gate_up is not None and 1 <= x.shape[0] <= 8 and x.shape[1] == self.w4_gate_up.in_features and x.dtype == torch.bfloat16:
+        if self.w4_gate_up is not None and 1 <= x.shape[0] <= 64 and x.shape[1] == self.w4_gate_up.in_features and x.dtype == torch.bfloat16:
             from .ops.turbo_kernels import w4_wmma_linear
 
             x = silu_and_mul(w4_wmma_linear(x, self.w4_gate_up, splits=1))
-            return w4_wmma_linear(x, self.w4_down, splits=4)
+            if x.shape[0] <= 16:
+                return w4_wmma_linear(x, self.w4_down, splits=4)
+            return _draft_linear(x, self.down_proj, self.w8_down)
         x = silu_and_mul(_draft_linear(x, self.gate_up_proj, self.w8_gate_up))
         return _draft_linear(x, self.down_proj, self.w8_down)
 
@@ -388,6 +397,8 @@ class Inkling2MarkovHead(nn.Module):
         self.w8_fold_weight: tuple[torch.Tensor, torch.Tensor] | None = None
         self.w6_fold_weight: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self.w4_fold_weight: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.w4_fold_wmma = None
+        self.fold_bias_pad: torch.Tensor | None = None
         self.rnn_bias: torch.Tensor | None = None
 
     @torch.no_grad()
@@ -435,6 +446,16 @@ class Inkling2MarkovHead(nn.Module):
         """One recurrence step; returns the new state and the TP-local bias."""
         assert self.fold_weight is not None and self.fold_bias is not None
         state, latent = self.step_latent(state, prev_tokens, context)
+        if (
+            self.w4_fold_wmma is not None
+            and 1 <= latent.shape[0] <= 16
+            and latent.dtype == torch.bfloat16
+        ):
+            from .ops.turbo_kernels import w4_wmma_linear
+
+            return state, w4_wmma_linear(
+                latent, self.w4_fold_wmma, bias=self.fold_bias_pad
+            )
         if self.w8_fold_weight is not None and latent.shape[0] == 1:
             from .ops.groupwise_w8_head import groupwise_w8_markov_addmm
 
@@ -546,7 +567,6 @@ class Inkling2DSparkModel(nn.Module):
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.fused_markov_argmax = (
             os.getenv("INKLING_AMD_DSPARK_MARKOV_FUSED_ARGMAX") == "1"
-            and self.max_num_reqs == 1
             and vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.speculative_config.draft_sample_method == "greedy"
             and config.markov_rank == 256
@@ -579,7 +599,7 @@ class Inkling2DSparkModel(nn.Module):
                 head.w6_fold_weight = pack_groupwise_w6_head(
                     head.fold_weight, group_size=64
                 )
-            elif head.w8_fold_weight is None:
+            elif head.w8_fold_weight is None and os.getenv("INKLING_AMD_TURBO_DRAFT_W4") != "1":
                 raise ValueError("Fused W8 Markov argmax requires the W8 fold bank")
         head.rnn_bias = head.rnn_proj.bias.float()
         num_cols = self.lm_head.weight.shape[0]
@@ -592,7 +612,6 @@ class Inkling2DSparkModel(nn.Module):
         self._prepare_w8_backbone()
         if (
             os.getenv("INKLING_AMD_TURBO_DRAFT_W4") == "1"
-            and self.max_num_reqs == 1
             and get_tensor_model_parallel_world_size() == 1
         ):
             from .ops.turbo_kernels import pack_w4_markov, pack_w4_wmma
@@ -602,7 +621,16 @@ class Inkling2DSparkModel(nn.Module):
                 layer.mlp.w4_gate_up = pack_w4_wmma(layer.mlp.gate_up_proj.weight)
                 layer.mlp.w4_down = pack_w4_wmma(layer.mlp.down_proj.weight)
             if head.fold_weight is not None:
-                head.w4_fold_weight = pack_w4_markov(head.fold_weight)
+                if self.max_num_reqs == 1 or self.fused_markov_argmax:
+                    head.w4_fold_weight = pack_w4_markov(head.fold_weight)
+                head.w4_fold_wmma = pack_w4_wmma(head.fold_weight)
+                bias_pad = torch.zeros(
+                    head.w4_fold_wmma.padded_out,
+                    dtype=head.fold_bias.dtype,
+                    device=head.fold_bias.device,
+                )
+                bias_pad[: head.fold_bias.shape[0]].copy_(head.fold_bias)
+                head.fold_bias_pad = bias_pad
 
     def _prepare_w8_backbone(self) -> None:
         assert self.lm_head is not None
@@ -611,7 +639,6 @@ class Inkling2DSparkModel(nn.Module):
             raise ValueError("INKLING_AMD_DSPARK_W8_BACKBONE expects 0, mlp, or all")
         if (
             mode != "0"
-            and self.max_num_reqs == 1
             and get_tensor_model_parallel_world_size() == 1
             and self.config.hidden_size == 2304
             and self.config.intermediate_size == 9216
@@ -631,6 +658,13 @@ class Inkling2DSparkModel(nn.Module):
                 if mode == "all":
                     layer.self_attn.w8_qkv = pack_draft_w8(layer.self_attn.qkv_proj.weight)
                     layer.self_attn.w8_o = pack_draft_w8(layer.self_attn.o_proj.weight)
+
+    def set_active_block_size(self, block: int) -> None:
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            attn.block = block
+            attn.window = attn._sliding_window_size + block if attn.is_local else 0
+            attn.cu_seqlens_q = getattr(attn, f"_cu_seqlens_b{block}")
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.prefix for layer in self.model.layers]
@@ -672,7 +706,7 @@ class Inkling2DSparkModel(nn.Module):
         if (
             self.w4_base_head is not None
             and hidden_states.ndim == 2
-            and 1 <= hidden_states.shape[0] <= 8
+            and 1 <= hidden_states.shape[0] <= 64
             and hidden_states.dtype == torch.bfloat16
         ):
             from .ops.turbo_kernels import w4_wmma_linear

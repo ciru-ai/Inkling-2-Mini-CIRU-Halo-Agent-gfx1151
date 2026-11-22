@@ -110,7 +110,7 @@ def main() -> int:
         (
             "math",
             "Compute the number of integer solutions (x, y) to x^2 + y^2 = 65^2 with x > 0 and y > 0. Give the final integer.",
-            512,
+            1024,
         ),
         (
             "pp2k",
@@ -145,7 +145,7 @@ def main() -> int:
             assert parsed.get("ok") is True and parsed.get("total") == 3, parsed
             print("  JSON check PASS")
         elif name == "math":
-            assert "14" in res["content"] or "28" in res["content"], res["content"][-120:]
+            assert "8" in res["content"], res["content"][-120:]
             print(f"  Math excerpt: {res['content'].strip()[-80:]!r}")
 
     if args.check_tools:
