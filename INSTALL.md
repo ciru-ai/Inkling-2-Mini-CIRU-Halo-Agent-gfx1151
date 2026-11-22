@@ -42,7 +42,7 @@ The last command should display a HIP version and an architecture beginning with
 ```bash
 git clone https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151.git
 cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
-INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.3.0"
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.3.1"
 INKLING_MODEL="$HOME/models/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151"
 
 bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
@@ -54,15 +54,15 @@ The installer verifies the package and model checksums, retrieves the pinned [vL
 
 You can also run `bash scripts/install.sh` from the root of the complete Hugging Face download.
 
-### Upgrading from v1.2.x to v1.3.0
+### Upgrading from v1.2.x or v1.3.0 to v1.3.1
 
 Your existing model and fitted weight files (`WEIGHTS.sha256`) are unchanged and do not need to be re-downloaded. Update the runtime repo, install into the new prefix, and restart the server:
 
 ```bash
 cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
 git fetch origin --tags
-git switch --detach v1.3.0
-INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.3.0"
+git switch --detach v1.3.1
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.3.1"
 
 bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
   --transformers-deps "$HOME/.local/share/inkling-halo/transformers-deps" \
@@ -73,7 +73,7 @@ Use `bash scripts/install.sh --verify-only` to check package integrity without d
 
 ## 3. Serve
 
-Start a single stream with DSpark and native tool calling. The launcher defaults to 1,048,576 tokens and reserves 52 GiB for the BF16 KV cache. Fitted weights are enabled automatically when the model directory includes them.
+Start the default all-in-one server with native ROCm vision, prefix caching, native tool calling, 8 concurrent sequences, 1,048,576-token context (52 GiB BF16 KV cache), FULL Target + Draft HIP graphs, and dual-depth adaptive DSpark speculation (`K=7` at `B=1`, `K=4` at `B=2..8`). Fitted weights are enabled automatically when the model directory includes them, and greedy draft proposals support both `temperature = 0` and `temperature > 0` losslessly via exact rejection sampling.
 
 ```bash
 "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --tools
@@ -97,25 +97,9 @@ Set `--context` to override the request limit. The launcher sizes the KV pool fr
 "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --context 32768 --kv-mib 24576 --tools
 ```
 
-### Serve concurrent agents (adaptive single-stream and 8-way throughput)
+### Send an image to the default server
 
-Version 1.3.0 upgrades `--mode concurrent` with multi-request FULL Target + Draft HIP graphs (`1..8` active sequences), batched W6/W4/WMMA projections, and dual-depth adaptive DSpark speculation (`K=7` for a single active request, switching automatically to `K=4` for 2–8 concurrent requests):
-
-```bash
-"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode concurrent --tools
-```
-
-Pass `--context 32768 --prefix-cache` for a compact 24 GiB KV pool, `--spec-tokens 4` to fix a four-token draft depth across all batch sizes, or `--vision` to enable image input alongside greedy concurrent serving.
-
-### Serve images and multi-agent vision workflows
-
-Start the `vision` preset. In v1.3.0, it runs with FULL Target + Draft HIP graphs (`1..8` sequences), four-token probabilistic DSpark speculation (`K=4`), prefix caching, and the default 1,048,576-token window (52 GiB BF16 KV cache):
-
-```bash
-"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode vision --tools
-```
-
-For a first check, use a small local PNG or JPEG such as 512 × 512. The example sends the image and a text question in one request.
+Because native ROCm vision is enabled in the default `vision` preset with zero text-turn penalty, you can send images directly to the default server above. For a first check, use a small local PNG or JPEG such as 512 × 512:
 
 ```bash
 python3 - ./example.png <<'PYTHON'
@@ -153,20 +137,23 @@ with urlopen(request, timeout=120) as response:
 PYTHON
 ```
 
-### Serve long prompts (32K–64K+ with hybrid global prefill)
+### Optional presets
 
-```bash
-"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode long-context --context 66048 --tools
-```
-
-Version 1.3.0 routes global far-history prefill (`>= 2,048` far tokens) through native ROCm AOTriton FlashAttention-2 with an online-softmax near-window merge, eliminating the 64K prefill cliff (`+61.6%` faster at 62K–64K prompts) and improving 64K decode split-KV memory bandwidth. This example matches the 64K benchmark with 66,048 total tokens and a 28 GiB BF16 KV pool.
-
-### Serve sampling (`T > 0`) workloads
-
-```bash
-"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode sampling --seqs 8 --context 32768 --prefix-cache --tools
-```
-
-Uses probabilistic DSpark (`K=4`) with FULL Target + Draft HIP graphs for temperature-sampled generation across 1–8 sequences.
+- **Text-only adaptive multi-agent (`--mode concurrent`):** Identical fast adaptive `K=7 @ B=1 / K=4 @ B=2..8` 8-sequence stack without loading the vision encoder or enabling prefix caching by default:
+  ```bash
+  "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode concurrent --tools
+  ```
+- **Dedicated single-stream (`--mode single`):** 1 sequence (`--seqs 1`), `K=7`, text-only:
+  ```bash
+  "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode single --tools
+  ```
+- **64K long-context preset (`--mode long-context`):** 1 sequence with a 28 GiB BF16 KV pool and hybrid AOTriton-Far + Triton-Near global prefill:
+  ```bash
+  "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode long-context --context 66048 --tools
+  ```
+- **Explicit probabilistic `K=4` drafting (`--mode sampling`):** Opts into full-vocab stochastic draft proposals (`draft_sample_method="probabilistic"`, fixed `K=4`, disables the `B=1` fused greedy Markov fast path). Add `--vision --prefix-cache` if combining probabilistic draft proposals with images:
+  ```bash
+  "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode sampling --seqs 8 --context 32768 --prefix-cache --tools
+  ```
 
 Pass `--original-weights` to use only the original Thinking Machines Lab checkpoint files without the fitted weight banks. Pass `--no-graphs` to fall back to eager execution if needed for debugging.
