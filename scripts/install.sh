@@ -178,6 +178,7 @@ for support_file in "$site_vllm"/*.so "$site_vllm/_version.py" "$site_vllm/vllm-
 done
 
 cp -a "$repo_root/scripts" "$stage/scripts"
+chmod +x "$stage/scripts/serve.sh"
 cp -a "$repo_root/LICENSE" "$repo_root/NOTICE" "$stage/"
 {
     printf '#!/usr/bin/env bash\n'

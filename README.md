@@ -56,6 +56,8 @@ The same runtime serves the unmodified checkpoint mirrored here. With that confi
 
 ## Install and run
 
+Version 1.2.1 fixes a ROCm busy wait that can keep a CPU core saturated while the server is idle on a single-GPU Strix Halo setup. Use the updated launcher and restart the server. Your existing checkpoint files can be reused. [v1.2.1 release](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151/releases/tag/v1.2.1)
+
 Install the ROCm vLLM runtime from the companion GitHub repository. The installation guide covers GPU access, dependencies, the checked-in installer, launch commands for the original and optimized weights, and verification through the OpenAI-compatible API. [GitHub runtime](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151) · [Installation guide](INSTALL.md)
 
 The Hugging Face repository contains the original model and DSpark draft checkpoint plus the separate CIRU expert weights used for the benchmark artwork. Download the release with the Hugging Face CLI.
