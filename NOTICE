@@ -1,0 +1,19 @@
+Inkling 2 Mini CIRU Halo Agent (gfx1151)
+Copyright 2026 Ciru
+
+Ciru's AMD runtime changes, fitted weight files and packaging are distributed
+under the Apache License, Version 2.0.
+
+Inkling 2 Mini model weights and tokenizer are by Thinking Machines Lab and
+are distributed under the Apache License, Version 2.0.
+https://huggingface.co/thinkingmachines/Inkling-2-Mini
+The release retains the original model and DSpark checkpoint bytes and adds
+separate fitted weight files derived from the original checkpoint.
+
+This runtime incorporates modified parts of vLLM, distributed under the Apache
+License, Version 2.0. Preserve the vLLM contributors' notices in the source.
+https://github.com/vllm-project/vllm
+
+The installer retrieves separately maintained Transformers source from Hugging
+Face, also distributed under the Apache License, Version 2.0.
+https://github.com/huggingface/transformers
