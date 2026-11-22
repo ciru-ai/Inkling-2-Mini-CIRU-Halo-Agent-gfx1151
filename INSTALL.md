@@ -1,6 +1,6 @@
 # Install Inkling 2 Mini CIRU Halo Agent (gfx1151)
 
-The release serves text, reasoning and native tool calls through an OpenAI-compatible API. It uses ROCm on the Radeon 8060S in the AMD Ryzen AI Max+ 395. The performance measurements used the 128 GB unified-memory configuration on NixOS with CPython 3.12.12, vLLM 0.34.0 ROCm 10, PyTorch 2.13.0 ROCm 10 and Triton 3.8.0. Ubuntu 24.04 LTS is a setup path for the same Linux wheel. The benchmark runs used NixOS.
+The release accepts text and image inputs and serves text, reasoning and native tool calls through an OpenAI-compatible API. It uses ROCm on the Radeon 8060S in the AMD Ryzen AI Max+ 395. The performance measurements used the 128 GB unified-memory configuration on NixOS with CPython 3.12.12, vLLM 0.34.0 ROCm 10, PyTorch 2.13.0 ROCm 10 and Triton 3.8.0. Ubuntu 24.04 LTS is a setup path for the same Linux wheel. The benchmark runs used NixOS.
 
 Budget at least 55 GB of free disk space for the model, ROCm Python environment and Triton cache. The model download includes about 23 GB of base and fitted weights.
 
@@ -42,7 +42,7 @@ The last command should display a HIP version and an architecture beginning with
 ```bash
 git clone https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151.git
 cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
-INKLING_ROOT="$HOME/.local/opt/inkling-halo"
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.1"
 INKLING_MODEL="$HOME/models/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151"
 
 bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
@@ -51,6 +51,8 @@ bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
 ```
 
 The installer verifies the package and model checksums, retrieves the pinned [vLLM runtime](https://github.com/ciru-ai/vllm/commit/7c4aa8b5b1d9aed94f4bfadcc38593a1f782066a) and [Transformers support](https://github.com/huggingface/transformers/commit/6173a2f679ff4ed393afc499aefc569da7e68bc1), and links the ROCm extensions into the standalone prefix. The launcher reuses the virtual environment. If you already have the complete [Hugging Face bundle](https://huggingface.co/jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151), omit `--download-model` and point the launcher at your copy.
+
+When upgrading from v1.0.0, run `git fetch origin --tags` and `git switch --detach v1.1.0` from your existing clone. Use the new install prefix above and omit `--download-model` to reuse the checkpoint files already on disk.
 
 Use `bash scripts/install.sh --verify-only` to check package integrity without downloading or installing anything. Add `--venv "$HOME/.venvs/inkling-halo"` to check the wheel versions and ROCm extension. Add `--transformers-deps "$HOME/.local/share/inkling-halo/transformers-deps"` with that virtual environment to verify the isolated dependencies.
 
@@ -71,6 +73,52 @@ python3 scripts/smoke-test.py --check-tools
 ```
 
 The API base URL is `http://127.0.0.1:18753/v1` and the model ID is `main`. The first launch builds a local Triton kernel cache and may take longer. Use `--dry-run` to preview the selected launch settings.
+
+### Serve images
+
+Start the vision preset. It uses a 32,768-token context, up to eight active sequences, and a shared 24 GiB BF16 KV cache. The original checkpoint contains the vision encoder weights.
+
+```bash
+"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode vision
+```
+
+For a first check, use a small local PNG or JPEG such as 512 × 512. The example sends the image and a text question in one request. Add `--tools` to the launch command if your client sends tool definitions.
+
+```bash
+python3 - ./example.png <<'PYTHON'
+import base64
+import json
+import mimetypes
+from pathlib import Path
+import sys
+from urllib.request import Request, urlopen
+
+image = Path(sys.argv[1])
+mime = mimetypes.guess_type(image.name)[0]
+if mime not in ("image/png", "image/jpeg"):
+    raise SystemExit("Choose a PNG or JPEG image.")
+encoded = base64.b64encode(image.read_bytes()).decode("ascii")
+payload = {
+    "model": "main",
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+            {"type": "text", "text": "Describe the main subject and its color in one sentence."},
+        ],
+    }],
+    "temperature": 0,
+    "max_tokens": 256,
+}
+request = Request(
+    "http://127.0.0.1:18753/v1/chat/completions",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urlopen(request, timeout=120) as response:
+    print(json.load(response)["choices"][0]["message"]["content"])
+PYTHON
+```
 
 ### Serve a 64K prompt
 

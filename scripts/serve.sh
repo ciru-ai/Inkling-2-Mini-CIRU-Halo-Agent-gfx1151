@@ -16,19 +16,20 @@ Modes & Serving Options:
   --mode MODE             single (default, single-stream HIP graph),
                           long-context (single-stream HIP graph, 66,048 tokens),
                           concurrent (eager greedy DSpark, 8 sequences),
-                          sampling (eager probabilistic DSpark)
+                          sampling (eager probabilistic DSpark),
+                          vision (image and text input, 32,768 tokens, 8 sequences)
   --served-model-name ID  OpenAI API model name (default: main)
   --host HOST             Bind host (default: 127.0.0.1)
   --port PORT             Bind port (default: 18753)
   --context N             Max prompt + completion tokens for a request
-  --seqs N                Max concurrent sequences (default: 1; 8 in concurrent)
+  --seqs N                Max concurrent sequences (default: 1; 8 in concurrent/vision)
   --batch-tokens N        Scheduler max_num_batched_tokens (default: 4096)
   --prefill-chunk-tokens N
                           Optional --long-prefill-token-threshold cap
   --kv-mib N              BF16 KV cache budget in MiB (auto-sized in 6144 MiB / 16K steps)
   --spec-tokens K         DSpark draft depth 1..7 (default: 7)
   --no-spec               Disable DSpark speculative decoding
-  --prefix-cache          Enable vLLM prefix caching
+  --prefix-cache          Enable vLLM prefix caching (enabled in vision mode)
   --tools                 Enable Inkling native auto tool calling
   --draft-graph           Enable DSpark draft HIP graph (on in single/long-context by default)
   --no-draft-graph        Disable DSpark draft HIP graph
@@ -116,8 +117,8 @@ done
 
 [[ -n "$model" ]] || die '--model PATH is required (download the release first)'
 case "$mode" in
-    single|long-context|concurrent|sampling) ;;
-    *) die "unsupported mode: $mode (expected single, long-context, concurrent, or sampling)" ;;
+    single|long-context|concurrent|sampling|vision) ;;
+    *) die "unsupported mode: $mode (expected single, long-context, concurrent, sampling, or vision)" ;;
 esac
 for number in "$port" "$batch_tokens" "$spec_tokens" ${context:+"$context"} ${seqs:+"$seqs"} ${prefill_chunk:+"$prefill_chunk"} ${kv_mib:+"$kv_mib"}; do
     [[ "$number" =~ ^[1-9][0-9]*$ ]] || die "expected a positive number, got $number"
@@ -125,17 +126,21 @@ done
 (( port <= 65535 && spec_tokens <= 7 )) || die 'port must be at most 65535 and draft depth at most 7'
 
 if [[ -z "$context" ]]; then
-    if [[ "$mode" == long-context ]]; then context=66048; else context=4096; fi
+    case "$mode" in
+        long-context) context=66048 ;;
+        vision) context=32768 ;;
+        *) context=4096 ;;
+    esac
 fi
 if [[ -z "$seqs" ]]; then
-    if [[ "$mode" == concurrent ]]; then seqs=8; else seqs=1; fi
+    if [[ "$mode" == concurrent || "$mode" == vision ]]; then seqs=8; else seqs=1; fi
 fi
 if (( ! original_weights )) && [[ -d "$model/optimized-weights" ]]; then
     expert_bank="$model/optimized-weights/experts"
     for layer in 6 12 17; do
         [[ -s "$expert_bank/layer$layer.pt" ]] || die "missing fitted expert weights for layer $layer; download the full bundle"
     done
-    if [[ "$mode" == single || "$mode" == long-context ]]; then
+    if [[ "$mode" == single || "$mode" == long-context || "$mode" == vision ]]; then
         coda_c1_dir="$model/optimized-weights/final-layers"
         for layer in 20 21 22 23; do
             [[ -s "$coda_c1_dir/layer$layer-c1.safetensors" ]] || die "missing fitted final-layer weights for layer $layer; download the full bundle"
@@ -165,6 +170,8 @@ fi
 if [[ -z "$kv_mib" ]]; then
     if [[ "$mode" == long-context && "$context" == 66048 ]]; then
         kv_mib=28672
+    elif [[ "$mode" == vision && "$context" == 32768 ]]; then
+        kv_mib=24576
     else
         kv_mib=$((6144 * ((context + 16383) / 16384)))
     fi
@@ -190,10 +197,13 @@ case "$mode" in
             router_mode=align
         fi
         ;;
-    sampling)
+    sampling|vision)
         sample_method=probabilistic
         ;;
 esac
+if [[ "$mode" == vision ]]; then
+    prefix_cache=1
+fi
 if [[ "$mode" == single ]]; then
     copy_draft="$target_graph"
 fi
@@ -299,11 +309,15 @@ settings=(
 if [[ -n "$joined_pypath" ]]; then
     settings=("PYTHONPATH=$joined_pypath" "${settings[@]}")
 fi
+input_mode=()
+if [[ "$mode" != vision ]]; then
+    input_mode+=(--language-model-only)
+fi
 command=(
     "$python_bin" -m vllm.entrypoints.cli.main serve "$model"
     --served-model-name "$served_name"
     --host "$host" --port "$port"
-    --language-model-only --dtype bfloat16 --reasoning-parser inkling
+    "${input_mode[@]}" --dtype bfloat16 --reasoning-parser inkling
     --max-model-len "$context" --max-num-seqs "$seqs"
     --max-num-batched-tokens "$batch_tokens"
     --kv-cache-memory-bytes "$((kv_mib * 1048576))"

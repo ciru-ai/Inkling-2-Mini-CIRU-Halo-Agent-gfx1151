@@ -2,7 +2,7 @@
 pretty_name: "Inkling 2 Mini · CIRU Halo Agent (gfx1151)"
 base_model: thinkingmachines/Inkling-2-Mini
 license: apache-2.0
-pipeline_tag: text-generation
+pipeline_tag: image-text-to-text
 tags:
   - vllm
   - rocm
@@ -11,17 +11,22 @@ tags:
   - gfx1151
   - long-context
   - speculative-decoding
+  - multimodal
 ---
 
 # Inkling 2 Mini · CIRU Halo Agent (gfx1151)
 
-Run Thinking Machines Lab's Inkling 2 Mini locally on **AMD Ryzen AI Max+ 395 with Radeon 8060S**. CIRU's ROCm vLLM build reached **1,691.3 prompt tokens/s**, **74.13 decode tokens/s across three single-request workloads**, and **88.92 aggregate output tokens/s across eight concurrent requests**. At a 65,536-token prompt, it reached **54.08 decode tokens/s**. It supports OpenAI-compatible text chat, streamed reasoning, and native tool calling.
+Run Thinking Machines Lab's Inkling 2 Mini locally on **AMD Ryzen AI Max+ 395 with Radeon 8060S**. CIRU's ROCm vLLM build reached **1,691.3 prompt tokens/s**, **74.13 decode tokens/s across three single-request workloads**, and **88.92 aggregate output tokens/s across eight concurrent requests**. At a 65,536-token prompt, it reached **54.08 decode tokens/s**. The OpenAI-compatible API accepts text and images, streams reasoning, and supports native tool calling.
 
 ![Inkling 2 Mini CIRU Halo Agent benchmark on AMD Ryzen AI Strix Halo](assets/inklingamd.png)
 
 *The artwork highlights the CIRU-optimized configuration on Strix Halo with seven-token DSpark speculative decoding.*
 
-## Performance on AMD Ryzen AI Strix Halo
+## Vision on Strix Halo
+
+Version 1.1 adds a native ROCm vision encoder. Start the `vision` preset to send an image alongside a text question. The original checkpoint already contains the vision weights. [Vision setup and image request](INSTALL.md#serve-images)
+
+## Text performance on AMD Ryzen AI Strix Halo
 
 Measured on a Ryzen AI Max+ 395 with Radeon 8060S graphics and 128 GB of unified memory. The runtime uses RDNA 3.5 matrix cores to accelerate expert projections, tunes attention for long prompts, and uses HIP graphs for single-request decode.
 
@@ -59,7 +64,7 @@ The Hugging Face repository contains the original model and DSpark draft checkpo
 hf download jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151 --local-dir ./weights
 ```
 
-The standard single-request preset uses a 4,096-token context. The long-context benchmark used a 66,048-token window to fit a 65,536-token prompt with room to generate. Context limits include input and output. This AMD runtime serves text inputs and outputs.
+The standard single-request preset uses a 4,096-token context. The long-context benchmark used a 66,048-token window to fit a 65,536-token prompt with room to generate. Context limits include input and output. The vision preset allows 32,768 total tokens, including the image tokens.
 
 ## Credits and license
 
