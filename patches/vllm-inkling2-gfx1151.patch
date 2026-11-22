@@ -1,5 +1,5 @@
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index 4ea6278..11289e6 100644
+index 4ea6278f..11289e65 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -1,5 +1,6 @@
@@ -30,7 +30,7 @@ index 4ea6278..11289e6 100644
          if (
              speculative_config is None
 diff --git a/vllm/models/inkling2/__init__.py b/vllm/models/inkling2/__init__.py
-index f3b9c12..c81417b 100644
+index f3b9c12c..c81417b2 100644
 --- a/vllm/models/inkling2/__init__.py
 +++ b/vllm/models/inkling2/__init__.py
 @@ -1,5 +1,6 @@
@@ -65,7 +65,7 @@ index f3b9c12..c81417b 100644
          return loop.Inkling2LoopForConditionalGeneration
 diff --git a/vllm/models/inkling2/amd/__init__.py b/vllm/models/inkling2/amd/__init__.py
 new file mode 100644
-index 0000000..fb2addd
+index 00000000..fb2adddb
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/__init__.py
 @@ -0,0 +1,3 @@
@@ -74,13 +74,12 @@ index 0000000..fb2addd
 +# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 diff --git a/vllm/models/inkling2/amd/attention.py b/vllm/models/inkling2/amd/attention.py
 new file mode 100644
-index 0000000..abc6f75
+index 00000000..2d826de1
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/attention.py
-@@ -0,0 +1,818 @@
+@@ -0,0 +1,856 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 +"""Inkling2 attention: relative-bias GQA with short-conv K/V, L2-clipped
 +q/k/r, gated output and per-token attention sinks."""
 +
@@ -695,11 +694,13 @@ index 0000000..abc6f75
 +        if (
 +            self._w6_verify_batch
 +            and self._w6_wmma_wo is not None
-+            and _can_project_w6_batch(output, 16)
++            and _can_project_w6_batch(output, 64)
 +        ):
 +            from .ops.turbo_kernels import w6_wmma_linear
 +
-+            return w6_wmma_linear(output, self._w6_wmma_wo, splits=4)
++            return w6_wmma_linear(
++                output, self._w6_wmma_wo, splits=4 if output.shape[0] <= 16 else 2,
++            )
 +        if (
 +            self._w6_verify_batch
 +            and self._groupwise_w6_wo is not None
@@ -761,39 +762,76 @@ index 0000000..abc6f75
 +        key_cache, value_cache = self._split_kv_cache(kv_cache)
 +        clipped_q = q.new_empty(q.shape)
 +        # Sheared as `rel_attention` reads it (see attention_prologue).
-+        rel_logits = q.new_empty(
-+            (num_tokens + 128, self.num_heads, self.rel_extent + 256)
-+        )
-+        attention_prologue(
-+            q,
-+            r.view(num_tokens, self.num_heads, self.d_rel),
-+            k,
-+            v,
-+            self.q_scale,
-+            self.r_scale,
-+            tau,
-+            self.rel_proj_shifted,
-+            self.k_sconv.conv_weight,
-+            self.v_sconv.conv_weight,
-+            k_dynamic,
-+            v_dynamic,
-+            conv_state.kv_cache,
-+            positions,
-+            conv_md.block_table,
-+            conv_md.seq_idx,
-+            conv_md.slot_mapping,
-+            conv_md.query_start,
-+            key_cache,
-+            value_cache,
-+            md.slot_mapping,
-+            clipped_q,
-+            rel_logits,
-+            md.query_start_loc,
-+            md.seq_lens,
-+            clip_threshold=self.qk_clip,
-+            rel_threshold=self.rel_clip,
-+            norm_eps=self.eps,
-+        )
++        if self._turbo_prefill_attn and num_tokens >= 16:
++            from .ops.turbo_kernels import turbo_attention_prologue
++
++            rel_logits = q.new_empty(
++                (self.num_heads, num_tokens + 128, self.rel_extent + 256)
++            ).transpose(0, 1)
++            turbo_attention_prologue(
++                q,
++                r.view(num_tokens, self.num_heads, self.d_rel),
++                k,
++                v,
++                self.q_scale,
++                self.r_scale,
++                tau,
++                self.rel_proj_shifted,
++                self.k_sconv.conv_weight,
++                self.v_sconv.conv_weight,
++                k_dynamic,
++                v_dynamic,
++                conv_state.kv_cache,
++                positions,
++                conv_md.block_table,
++                conv_md.seq_idx,
++                conv_md.slot_mapping,
++                conv_md.query_start,
++                key_cache,
++                value_cache,
++                md.slot_mapping,
++                clipped_q,
++                rel_logits,
++                md.query_start_loc,
++                md.seq_lens,
++                clip_threshold=self.qk_clip,
++                rel_threshold=self.rel_clip,
++                norm_eps=self.eps,
++            )
++        else:
++            rel_logits = q.new_empty(
++                (num_tokens + 128, self.num_heads, self.rel_extent + 256)
++            )
++            attention_prologue(
++                q,
++                r.view(num_tokens, self.num_heads, self.d_rel),
++                k,
++                v,
++                self.q_scale,
++                self.r_scale,
++                tau,
++                self.rel_proj_shifted,
++                self.k_sconv.conv_weight,
++                self.v_sconv.conv_weight,
++                k_dynamic,
++                v_dynamic,
++                conv_state.kv_cache,
++                positions,
++                conv_md.block_table,
++                conv_md.seq_idx,
++                conv_md.slot_mapping,
++                conv_md.query_start,
++                key_cache,
++                value_cache,
++                md.slot_mapping,
++                clipped_q,
++                rel_logits,
++                md.query_start_loc,
++                md.seq_lens,
++                clip_threshold=self.qk_clip,
++                rel_threshold=self.rel_clip,
++                norm_eps=self.eps,
++            )
 +        # Decode and verify batches split the keys; the split count follows
 +        # the batch alone, so it holds for every replay of a CUDA graph.
 +        m1 = md.seq_lens.shape[0] == md.max_query_len == 1
@@ -898,7 +936,7 @@ index 0000000..abc6f75
 +        )
 diff --git a/vllm/models/inkling2/amd/conv_state.py b/vllm/models/inkling2/amd/conv_state.py
 new file mode 100644
-index 0000000..be5321f
+index 00000000..be5321f1
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/conv_state.py
 @@ -0,0 +1,279 @@
@@ -1183,7 +1221,7 @@ index 0000000..be5321f
 +    )
 diff --git a/vllm/models/inkling2/amd/copy_drafts.py b/vllm/models/inkling2/amd/copy_drafts.py
 new file mode 100644
-index 0000000..bf7963f
+index 00000000..bf7963f5
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/copy_drafts.py
 @@ -0,0 +1,59 @@
@@ -1248,13 +1286,12 @@ index 0000000..bf7963f
 +    )
 diff --git a/vllm/models/inkling2/amd/dspark.py b/vllm/models/inkling2/amd/dspark.py
 new file mode 100644
-index 0000000..c3503d1
+index 00000000..6af551fc
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/dspark.py
-@@ -0,0 +1,806 @@
+@@ -0,0 +1,803 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 +"""Inkling2 DSpark draft (`mtp.safetensors`): an anchor plus mask block run
 +through a small dense transformer over DFlare-mixed target-feature K/V, then a
 +recurrent (`rnn_hidden`) Markov head. Numerics follow the reference
@@ -1585,9 +1622,7 @@ index 0000000..c3503d1
 +            from .ops.turbo_kernels import w4_wmma_linear
 +
 +            x = silu_and_mul(w4_wmma_linear(x, self.w4_gate_up, splits=1))
-+            if x.shape[0] <= 16:
-+                return w4_wmma_linear(x, self.w4_down, splits=4)
-+            return _draft_linear(x, self.down_proj, self.w8_down)
++            return w4_wmma_linear(x, self.w4_down, splits=4)
 +        x = silu_and_mul(_draft_linear(x, self.gate_up_proj, self.w8_gate_up))
 +        return _draft_linear(x, self.down_proj, self.w8_down)
 +
@@ -2060,13 +2095,12 @@ index 0000000..c3503d1
 +        return loaded
 diff --git a/vllm/models/inkling2/amd/model.py b/vllm/models/inkling2/amd/model.py
 new file mode 100644
-index 0000000..e605fc8
+index 00000000..ba8e0727
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/model.py
-@@ -0,0 +1,908 @@
+@@ -0,0 +1,1001 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 +"""Eager TP1 text backend for Inkling 2 Mini on ROCm."""
 +
 +import os
@@ -2325,9 +2359,35 @@ index 0000000..e605fc8
 +            down, gain_forget = self.controller_down, self.controller_gain_forget
 +            assert controller.down_weight.data_ptr() == down[i].data_ptr()
 +            assert controller.gain_weight.data_ptr() == gain_forget[i].data_ptr()
++        self.controller_down_t = None
 +        if self.use_packed_loop and self.controller_gain_forget.is_cuda:
 +            # This is the same FP32 widening that the eager path does per visit.
 +            self.controller_gain_forget_fp32 = self.controller_gain_forget.float()
++            self.controller_down_t = self.controller_down.transpose(1, 2).contiguous()
++
++    def blend_zeromat(
++        self,
++        streams: slice,
++        dest: torch.Tensor,
++        bank0: torch.Tensor,
++        bank1: torch.Tensor,
++        coeffs: torch.Tensor,
++        norm_weight: torch.Tensor,
++        norm_eps: float,
++    ) -> torch.Tensor | None:
++        down_t = getattr(self, "controller_down_t", None)
++        if down_t is None and self.controller_down.is_cuda:
++            down_t = self.controller_down.transpose(1, 2).contiguous()
++            self.controller_down_t = down_t
++        if down_t is None:
++            return None
++        from .ops.turbo_kernels import fused_loop_zeromat_prefill
++
++        return fused_loop_zeromat_prefill(
++            dest, bank0, bank1, coeffs,
++            down_t[streams], self.controller_gain_forget[streams],
++            norm_weight, norm_eps,
++        )
 +
 +    def blend(
 +        self,
@@ -2340,6 +2400,25 @@ index 0000000..e605fc8
 +        """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
 +        broadcast over streams) and `message`, each output RMS-normalized
 +        with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
++        if (
++            self.use_packed_loop
++            and message.shape[1] >= 64
++            and os.getenv("INKLING_AMD_TURBO_PREFILL_ATTN") == "1"
++            and os.getenv("INKLING_AMD_FUSED_LOOP_ALLINONE", "1") != "0"
++        ):
++            down_t = getattr(self, "controller_down_t", None)
++            if down_t is None and self.controller_down.is_cuda:
++                down_t = self.controller_down.transpose(1, 2).contiguous()
++                self.controller_down_t = down_t
++            if down_t is not None:
++                from .ops.turbo_kernels import fused_loop_allinone_prefill
++
++                result = fused_loop_allinone_prefill(
++                    dest, message, down_t[streams],
++                    self.controller_gain_forget[streams], norm_weight, norm_eps,
++                )
++                if result is not None:
++                    return result
 +        pair = pair_rms_norm(dest, message, packed=self.use_packed_loop)
 +        down_weight = self.controller_down[streams]
 +        gain_forget = None
@@ -2373,7 +2452,7 @@ index 0000000..e605fc8
 +                    return result
 +            if (
 +                self.use_packed_loop
-+                and pair.shape[1] >= 64
++                and pair.shape[1] >= 16
 +                and os.getenv("INKLING_AMD_TURBO_PREFILL_ATTN") == "1"
 +            ):
 +                from .ops.turbo_kernels import fused_loop_prefill_blend
@@ -2510,23 +2589,51 @@ index 0000000..e605fc8
 +        partial = stack[num_blocks]
 +        owner = layer.conv_states[pass_idx]
 +        messages = None
++        msg_coeffs = None
 +        if bank is not None:
 +            assert isinstance(layer, Inkling2LoopDecoderLayer) and inputs is not None
-+            messages = attn_res(
-+                bank[:1],
-+                bank[1],
-+                None,
-+                self.message_queries[layer_id - self.loop_core.start],
-+                None,
-+                0.0,
-+                True,
-+            )
 +            norm = layer.attn_norm
 +            destinations = inputs.expand(3, -1, -1) if layer.is_local else inputs
 +            norm_weight = norm.weight.expand(3, -1) if layer.is_local else norm.weight
-+            attn_inputs = layer.blend(
-+                slice(0, 3), destinations, messages[:3], norm_weight, norm.eps
-+            )
++            attn_inputs = None
++            if (
++                layer.use_packed_loop
++                and partial.shape[0] >= 64
++                and os.getenv("INKLING_AMD_TURBO_PREFILL_ATTN") == "1"
++                and os.getenv("INKLING_AMD_FUSED_LOOP_ALLINONE", "1") != "0"
++            ):
++                from .ops.hip_moe_prefill import hip_attn_res_q4_coeffs
++
++                msg_coeffs = hip_attn_res_q4_coeffs(
++                    bank[0],
++                    bank[1],
++                    self.message_queries[layer_id - self.loop_core.start],
++                )
++                if msg_coeffs is not None:
++                    attn_inputs = layer.blend_zeromat(
++                        slice(0, 3),
++                        destinations,
++                        bank[0],
++                        bank[1],
++                        msg_coeffs[:3],
++                        norm_weight,
++                        norm.eps,
++                    )
++                    if attn_inputs is None:
++                        msg_coeffs = None
++            if attn_inputs is None:
++                messages = attn_res(
++                    bank[:1],
++                    bank[1],
++                    None,
++                    self.message_queries[layer_id - self.loop_core.start],
++                    None,
++                    0.0,
++                    True,
++                )
++                attn_inputs = layer.blend(
++                    slice(0, 3), destinations, messages[:3], norm_weight, norm.eps
++                )
 +        elif inputs is None:
 +            assert num_blocks == 0
 +            attn_inputs = [
@@ -2541,7 +2648,8 @@ index 0000000..e605fc8
 +            owner=owner,
 +        )
 +        first = layer_id % self.block_size == 0
-+        mlp_norm = layer.mlp_norm if messages is None else None
++        has_loop_msg = (messages is not None) or (msg_coeffs is not None)
++        mlp_norm = layer.mlp_norm if not has_loop_msg else None
 +        query = self.attn_res.mlp_queries[layer_id]
 +        if first:
 +            mlp_inputs = self._mix(stack[:num_blocks + 1], attn_out, query, mlp_norm)
@@ -2549,7 +2657,27 @@ index 0000000..e605fc8
 +            mlp_inputs = self._mix(
 +                stack[:num_blocks], partial, query, mlp_norm, attn_out
 +            )
-+        if messages is not None:
++        if msg_coeffs is not None:
++            norm = layer.mlp_norm
++            zm_mlp = layer.blend_zeromat(
++                slice(3, 4), mlp_inputs, bank[0], bank[1], msg_coeffs[3:], norm.weight, norm.eps
++            )
++            if zm_mlp is not None:
++                mlp_inputs = zm_mlp
++            else:
++                messages = attn_res(
++                    bank[:1],
++                    bank[1],
++                    None,
++                    self.message_queries[layer_id - self.loop_core.start],
++                    None,
++                    0.0,
++                    True,
++                )
++                mlp_inputs = layer.blend(
++                    slice(3, 4), mlp_inputs, messages[3:], norm.weight, norm.eps
++                )
++        elif messages is not None:
 +            norm = layer.mlp_norm
 +            mlp_inputs = layer.blend(
 +                slice(3, 4), mlp_inputs, messages[3:], norm.weight, norm.eps
@@ -2974,13 +3102,12 @@ index 0000000..e605fc8
 +        return loaded
 diff --git a/vllm/models/inkling2/amd/moe.py b/vllm/models/inkling2/amd/moe.py
 new file mode 100644
-index 0000000..ed2700a
+index 00000000..24fe47a9
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/moe.py
-@@ -0,0 +1,555 @@
+@@ -0,0 +1,583 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 +"""Inkling 2 Mini TP1 ROCm experts, preserving the publisher's packed weights."""
 +
 +from pathlib import Path
@@ -3068,6 +3195,13 @@ index 0000000..ed2700a
 +            from .ops.router import router_scores_m1
 +
 +            scores = router_scores_m1(x, self.weight, self.bias)
++        elif (
++            x.shape[0] >= 64
++            and os.getenv("INKLING_AMD_TURBO_PREFILL_MOE", "0") not in ("", "0")
++        ):
++            from .ops.turbo_kernels import router_scores_prefill
++
++            scores = router_scores_prefill(x, self.weight, self.bias)
 +        if scores is None:
 +            score = self.fp32_logits(x).sigmoid()
 +            corrected = score + self.bias
@@ -3338,13 +3472,35 @@ index 0000000..ed2700a
 +            and (self.source_wmma_banks or self.verifier_wmma_banks)
 +            and (plan.block_m, plan.block_n, plan.block_k) == (64, 128, 64)
 +        ):
++            bank = self.verifier_wmma_banks.get(name)
++            if turbo_prefill_mode != "bf16":
++                from .ops.hip_moe_prefill import hip_moe_prefill_projection
++
++                if bank is not None:
++                    bkind = "coda" if self.coda_c1_path is not None else "mixed"
++                    hip_out = hip_moe_prefill_projection(
++                        x, bank, plan, bank_kind=bkind,
++                        fused_activation=fused_activation,
++                        out_fp16=(name == "w13"),
++                    )
++                    if hip_out is not None:
++                        return hip_out
++                elif self.source_wmma_banks:
++                    hip_out = hip_moe_prefill_projection(
++                        x, self.source_wmma_banks[name], plan, bank_kind="source",
++                        fused_activation=fused_activation,
++                        out_fp16=(name == "w13"),
++                    )
++                    if hip_out is not None:
++                        return hip_out
++            if x.dtype != torch.bfloat16:
++                x = x.to(torch.bfloat16)
 +            from .ops.turbo_kernels import (
 +                coda_wmma_prefill_m64,
 +                mixed_wmma_prefill_m64,
 +                source_wmma_turbo_projection,
 +            )
 +
-+            bank = self.verifier_wmma_banks.get(name)
 +            if bank is not None:
 +                if self.coda_c1_path is not None:
 +                    if turbo_prefill_mode != "bf16":
@@ -3535,7 +3691,7 @@ index 0000000..ed2700a
 +                * self.up_cap * torch.tanh(up / self.up_cap) * gamma[..., None]).bfloat16()
 diff --git a/vllm/models/inkling2/amd/moe_mxfp8_decode.py b/vllm/models/inkling2/amd/moe_mxfp8_decode.py
 new file mode 100644
-index 0000000..6b79691
+index 00000000..6b79691f
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/moe_mxfp8_decode.py
 @@ -0,0 +1,55 @@
@@ -3596,7 +3752,7 @@ index 0000000..6b79691
 +    return output
 diff --git a/vllm/models/inkling2/amd/moe_prefill.py b/vllm/models/inkling2/amd/moe_prefill.py
 new file mode 100644
-index 0000000..a151a3c
+index 00000000..a151a3cb
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/moe_prefill.py
 @@ -0,0 +1,317 @@
@@ -3919,7 +4075,7 @@ index 0000000..a151a3c
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/__init__.py b/vllm/models/inkling2/amd/ops/__init__.py
 new file mode 100644
-index 0000000..fb2addd
+index 00000000..fb2adddb
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/__init__.py
 @@ -0,0 +1,3 @@
@@ -3928,7 +4084,7 @@ index 0000000..fb2addd
 +# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 diff --git a/vllm/models/inkling2/amd/ops/attention.py b/vllm/models/inkling2/amd/ops/attention.py
 new file mode 100644
-index 0000000..002e97a
+index 00000000..002e97a2
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/attention.py
 @@ -0,0 +1,720 @@
@@ -4654,13 +4810,12 @@ index 0000000..002e97a
 +    return output
 diff --git a/vllm/models/inkling2/amd/ops/attn_res.py b/vllm/models/inkling2/amd/ops/attn_res.py
 new file mode 100644
-index 0000000..4f3cf80
+index 00000000..66435c7b
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/attn_res.py
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,288 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 +"""Fused portable row kernel for Inkling 2 block attention residuals."""
 +
 +import torch
@@ -4826,6 +4981,68 @@ index 0000000..4f3cf80
 +    tl.store(Out + (2 * tokens + token) * D + cols_a, m2a, mask_a)
 +    tl.store(Out + (2 * tokens + token) * D + cols_b, m2b, mask_b)
 +
++
++
++@triton.jit
++def _attn_res_q4_n1_kernel(
++    Stack, Last, Addend, Queries, NormWeight, Out,
++    stride_stack, stride_stack_row, stride_last, stride_add,
++    stride_query, stride_norm, tokens, eps, norm_eps,
++    D: tl.constexpr, HAS_ADDEND: tl.constexpr,
++    NORMALIZE_VALUES: tl.constexpr, APPLY_NORM: tl.constexpr,
++    BLOCK_A: tl.constexpr, BLOCK_B: tl.constexpr,
++):
++    token = tl.program_id(0).to(tl.int64)
++    Stack += token * stride_stack_row
++    Last += token * stride_last
++    Addend += token * stride_add
++    cols_a = tl.arange(0, BLOCK_A)
++    cols_b = BLOCK_A + tl.arange(0, BLOCK_B)
++    mask_a = cols_a < D
++    mask_b = cols_b < D
++    source = (Stack, Last, Addend, stride_stack)
++
++    a0 = _load_source(*source, cols_a, mask_a, 0, 1, HAS_ADDEND)
++    b0 = _load_source(*source, cols_b, mask_b, 0, 1, HAS_ADDEND)
++    r0 = tl.rsqrt(tl.div_rn(tl.sum(a0 * a0) + tl.sum(b0 * b0), D) + eps)
++    a1 = _load_source(*source, cols_a, mask_a, 1, 1, HAS_ADDEND)
++    b1 = _load_source(*source, cols_b, mask_b, 1, 1, HAS_ADDEND)
++    r1 = tl.rsqrt(tl.div_rn(tl.sum(a1 * a1) + tl.sum(b1 * b1), D) + eps)
++
++    if NORMALIZE_VALUES:
++        a0 = a0 * r0
++        b0 = b0 * r0
++        a1 = a1 * r1
++        b1 = b1 * r1
++
++    for qi in tl.static_range(4):
++        qa = tl.load(Queries + qi * stride_query + cols_a, mask_a, 0)
++        qb = tl.load(Queries + qi * stride_query + cols_b, mask_b, 0)
++        if NORMALIZE_VALUES:
++            l0 = tl.sum(qa * a0) + tl.sum(qb * b0)
++            l1 = tl.sum(qa * a1) + tl.sum(qb * b1)
++        else:
++            l0 = (tl.sum(qa * a0) + tl.sum(qb * b0)) * r0
++            l1 = (tl.sum(qa * a1) + tl.sum(qb * b1)) * r1
++        m = tl.maximum(l0, l1)
++        e0 = tl.exp(l0 - m)
++        e1 = tl.exp(l1 - m)
++        inv = tl.div_rn(1.0, e0 + e1)
++        w0 = e0 * inv
++        w1 = e1 * inv
++        ma = tl.fma(w0, a0, w1 * a1)
++        mb = tl.fma(w0, b0, w1 * b1)
++        if APPLY_NORM:
++            rn = tl.rsqrt(tl.div_rn(tl.sum(ma * ma) + tl.sum(mb * mb), D) + norm_eps)
++            ma = ma * rn * tl.load(NormWeight + qi * stride_norm + cols_a, mask_a, 0).to(tl.float32)
++            mb = mb * rn * tl.load(NormWeight + qi * stride_norm + cols_b, mask_b, 0).to(tl.float32)
++        if Out.dtype.element_ty == tl.bfloat16:
++            ma = ma.to(tl.bfloat16, fp_downcast_rounding="rtne")
++            mb = mb.to(tl.bfloat16, fp_downcast_rounding="rtne")
++        tl.store(Out + (qi * tokens + token) * D + cols_a, ma, mask_a)
++        tl.store(Out + (qi * tokens + token) * D + cols_b, mb, mask_b)
++
++
 +def fused_attn_res(
 +    stack: torch.Tensor,
 +    last: torch.Tensor,
@@ -4855,7 +5072,16 @@ index 0000000..4f3cf80
 +    dtype = last.dtype if norm_weight is not None else torch.float32
 +    out = last.new_empty((queries.shape[0], tokens, width), dtype=dtype)
 +    if tokens:
-+        if queries.shape[0] == 3 and tokens >= 64:
++        if queries.shape[0] == 4 and stack.shape[0] == 1 and tokens >= 64:
++            _attn_res_q4_n1_kernel[(tokens,)](
++                stack, last, tail, queries, weight, out,
++                stack.stride(0), stack.stride(1), last.stride(0), tail.stride(0),
++                queries.stride(0), weight.stride(0), tokens, eps, norm_eps,
++                D=width, HAS_ADDEND=addend is not None,
++                NORMALIZE_VALUES=normalize_values, APPLY_NORM=norm_weight is not None,
++                BLOCK_A=2048, BLOCK_B=256, num_warps=4, enable_fp_fusion=False,
++            )
++        elif queries.shape[0] == 3 and tokens >= 64:
 +            _attn_res_q3_kernel[(tokens,)](
 +                stack, last, tail, queries, weight, out,
 +                stack.stride(0), stack.stride(1), last.stride(0), tail.stride(0),
@@ -4878,7 +5104,7 @@ index 0000000..4f3cf80
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/coda_wmma_pretile.py b/vllm/models/inkling2/amd/ops/coda_wmma_pretile.py
 new file mode 100644
-index 0000000..0ccc367
+index 00000000..0ccc3676
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/coda_wmma_pretile.py
 @@ -0,0 +1,182 @@
@@ -5066,7 +5292,7 @@ index 0000000..0ccc367
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/dspark.py b/vllm/models/inkling2/amd/ops/dspark.py
 new file mode 100644
-index 0000000..9bb1ae7
+index 00000000..9bb1ae76
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/dspark.py
 @@ -0,0 +1,269 @@
@@ -5341,7 +5567,7 @@ index 0000000..9bb1ae7
 +    return logits.masked_fill(logits.isnan(), float("-inf")).argmax(-1)
 diff --git a/vllm/models/inkling2/amd/ops/dspark_w8_backbone.py b/vllm/models/inkling2/amd/ops/dspark_w8_backbone.py
 new file mode 100644
-index 0000000..f8ad5a1
+index 00000000..f8ad5a19
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/dspark_w8_backbone.py
 @@ -0,0 +1,141 @@
@@ -5488,7 +5714,7 @@ index 0000000..f8ad5a1
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/expert_e2m1_g16.py b/vllm/models/inkling2/amd/ops/expert_e2m1_g16.py
 new file mode 100644
-index 0000000..b2f08ca
+index 00000000..b2f08cac
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/expert_e2m1_g16.py
 @@ -0,0 +1,111 @@
@@ -5605,7 +5831,7 @@ index 0000000..b2f08ca
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/expert_nvfp4.py b/vllm/models/inkling2/amd/ops/expert_nvfp4.py
 new file mode 100644
-index 0000000..d7c4c8b
+index 00000000..d7c4c8bd
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/expert_nvfp4.py
 @@ -0,0 +1,109 @@
@@ -5720,7 +5946,7 @@ index 0000000..d7c4c8b
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/grouped_decode.py b/vllm/models/inkling2/amd/ops/grouped_decode.py
 new file mode 100644
-index 0000000..a85a2f3
+index 00000000..a85a2f38
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/grouped_decode.py
 @@ -0,0 +1,350 @@
@@ -6076,7 +6302,7 @@ index 0000000..a85a2f3
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/groupwise_w6_head.py b/vllm/models/inkling2/amd/ops/groupwise_w6_head.py
 new file mode 100644
-index 0000000..bf3f4b5
+index 00000000..bf3f4b52
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/groupwise_w6_head.py
 @@ -0,0 +1,443 @@
@@ -6525,7 +6751,7 @@ index 0000000..bf3f4b5
 +    return result
 diff --git a/vllm/models/inkling2/amd/ops/groupwise_w8_head.py b/vllm/models/inkling2/amd/ops/groupwise_w8_head.py
 new file mode 100644
-index 0000000..da6477a
+index 00000000..da6477ad
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/groupwise_w8_head.py
 @@ -0,0 +1,225 @@
@@ -6754,9 +6980,1394 @@ index 0000000..da6477a
 +
 +pack_groupwise_w8_head = pack_groupwise_w8
 +groupwise_w8_head_linear = groupwise_w8_gemv
+diff --git a/vllm/models/inkling2/amd/ops/hip_moe_prefill.hip b/vllm/models/inkling2/amd/ops/hip_moe_prefill.hip
+new file mode 100644
+index 00000000..b997f2f4
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/hip_moe_prefill.hip
+@@ -0,0 +1,845 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 CIRU AI.
++// Native RDNA 3.5 (gfx1151) prefill kernels for Inkling 2 Mini:
++//   1. Paired-M128 + M64-tail (1x4) K64 WMMA MoE prefill (source NVFP4, mixed INT4/C1, coda C1)
++//      with direct BF16 X-load on w13, hardware exp2f SwiGLU, uint32 coalesced stores, and FP16 handoff.
++//   2. 1-warp (zero-barrier, zero-LDS, uint2 coalesced) fused K+V short-conv + L2-clip/RMSNorm prefill.
++//   3. Zero-materialization 4-query AttnRes message coefficient kernel (BF16 bank -> [4, T, 2] FP32).
++
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#include <stdint.h>
++
++typedef _Float16 half16 __attribute__((ext_vector_type(16)));
++typedef float float8 __attribute__((ext_vector_type(8)));
++
++__device__ __forceinline__ uint16_t f32_to_bf16_rtne(float x) {
++    uint32_t u = __float_as_uint(x);
++    uint32_t lsb = (u >> 16) & 1u;
++    u += 0x7FFFu + lsb;
++    return (uint16_t)(u >> 16);
++}
++
++__device__ __forceinline__ float bf16_round_f32(float x) {
++    uint16_t h = f32_to_bf16_rtne(x);
++    return __uint_as_float((uint32_t)h << 16);
++}
++
++__device__ __forceinline__ float bf16_to_f32(uint16_t h) {
++    return __uint_as_float((uint32_t)h << 16);
++}
++
++__device__ __forceinline__ uint32_t pack_bf16x2(float a, float b) {
++    return (uint32_t)f32_to_bf16_rtne(a) | ((uint32_t)f32_to_bf16_rtne(b) << 16);
++}
++
++__device__ __forceinline__ float f16_bits_to_f32(uint16_t h) {
++    _Float16 f;
++    __builtin_memcpy(&f, &h, sizeof(f));
++    return (float)f;
++}
++
++__device__ __forceinline__ float fast_tanh_hw(float x) {
++    float ax = fabsf(x);
++    float e = exp2f(-2.8853900817779268f * ax);
++    return copysignf((1.0f - e) / (1.0f + e), x);
++}
++
++__device__ __forceinline__ float fast_sigmoid_hw(float x) {
++    return 1.0f / (1.0f + exp2f(-1.4426950408889634f * x));
++}
++
++__device__ __forceinline__ uint4 bf16x8_to_f16x8(uint4 v) {
++    auto cvt2 = [](uint32_t u) -> uint32_t {
++        float f0 = bf16_to_f32((uint16_t)(u & 0xFFFFu));
++        float f1 = bf16_to_f32((uint16_t)(u >> 16));
++        uint32_t pk;
++        asm("v_cvt_pkrtz_f16_f32 %0, %1, %2" : "=v"(pk) : "v"(f0), "v"(f1));
++        return pk;
++    };
++    return make_uint4(cvt2(v.x), cvt2(v.y), cvt2(v.z), cvt2(v.w));
++}
++
++// ============================================================================
++// 1. PAIRED-M128 + M64-TAIL K64 WMMA MOE PREFILL
++// ============================================================================
++
++// 1-warp coalesced LDS-cached scan of plan64's expert_ids into:
++//   PairIdx[0..Counts[0]-1]: starting m64 index `b` where Expert[b] == Expert[b+1] (128 contiguous rows)
++//   TailIdx[0..Counts[1]-1]: leftover single m64 index `b` (64 rows)
++__global__ void pair_m64_blocks_kernel(
++    const int32_t* __restrict__ Expert,
++    const int32_t* __restrict__ Padded,
++    int32_t* __restrict__ PairIdx,
++    int32_t* __restrict__ TailIdx,
++    int32_t* __restrict__ Counts,
++    int max_blocks
++) {
++    __shared__ int32_t s_exp[2048];
++    int n_blocks = min(*Padded / 64, max_blocks);
++    if (n_blocks <= 2048) {
++        for (int i = threadIdx.x; i < n_blocks; i += 32) {
++            s_exp[i] = Expert[i];
++        }
++        __syncthreads();
++        if (threadIdx.x != 0) return;
++        int np = 0, nt = 0, i = 0;
++        while (i < n_blocks) {
++            int e = s_exp[i];
++            if (e < 0) { i += 1; continue; }
++            if (i + 1 < n_blocks && s_exp[i + 1] == e) {
++                PairIdx[np++] = i;
++                i += 2;
++            } else {
++                TailIdx[nt++] = i;
++                i += 1;
++            }
++        }
++        Counts[0] = np;
++        Counts[1] = nt;
++    } else {
++        if (threadIdx.x != 0) return;
++        int np = 0, nt = 0, i = 0;
++        while (i < n_blocks) {
++            int e = Expert[i];
++            if (e < 0) { i += 1; continue; }
++            if (i + 1 < n_blocks && Expert[i + 1] == e) {
++                PairIdx[np++] = i;
++                i += 2;
++            } else {
++                TailIdx[nt++] = i;
++                i += 1;
++            }
++        }
++        Counts[0] = np;
++        Counts[1] = nt;
++    }
++}
++
++// Unpack 8 packed bytes (= 16 NVFP4 nibbles, 1 E4M3 scale byte) -> 2x uint4 (= 16 f16s)
++__device__ __forceinline__ void unpack_nvfp4_16_u4(
++    uint32_t p0, uint32_t p1, uint32_t scale_byte, uint4 &o0, uint4 &o1
++) {
++    uint32_t scale_f16 = (scale_byte << 7) + 0x1C00u;
++    uint32_t scale_pk = scale_f16 | (scale_f16 << 16);
++    uint32_t dst[8];
++    const uint32_t words[2] = {p0, p1};
++    #pragma unroll
++    for (int w = 0; w < 2; ++w) {
++        uint32_t u = words[w];
++        #pragma unroll
++        for (int b = 0; b < 4; ++b) {
++            uint32_t packed = (u >> (b * 8)) & 0xFFu;
++            uint32_t sel = 0x000C000Cu | ((packed & 7u) << 8) | ((packed & 0x70u) << 20);
++            uint32_t mags;
++            asm("v_perm_b32 %0, %1, %2, %3"
++                : "=v"(mags) : "v"(0x4A484644u), "v"(0x42403C00u), "v"(sel));
++            uint32_t sgn = mags | ((packed & 8u) << 12) | ((packed & 128u) << 24);
++            uint32_t scaled;
++            asm("v_pk_mul_f16 %0, %1, %2"
++                : "=v"(scaled) : "v"(sgn), "v"(scale_pk));
++            dst[w * 4 + b] = scaled;
++        }
++    }
++    o0 = make_uint4(dst[0], dst[1], dst[2], dst[3]);
++    o1 = make_uint4(dst[4], dst[5], dst[6], dst[7]);
++}
++
++// Unpack 8 packed bytes (= 16 signed INT4 values, 1 BF16 group-32 scale) -> 2x uint4 (= 16 f16s)
++__device__ __forceinline__ void unpack_int4_16_u4(
++    uint32_t p0, uint32_t p1, float scale_f32, uint4 &o0, uint4 &o1
++) {
++    uint32_t dst[8];
++    const uint32_t words[2] = {p0, p1};
++    #pragma unroll
++    for (int w = 0; w < 2; ++w) {
++        uint32_t u = words[w];
++        #pragma unroll
++        for (int b = 0; b < 4; ++b) {
++            uint32_t packed = (u >> (b * 8)) & 0xFFu;
++            float f0 = (float)(((int)(packed & 15u) ^ 8) - 8) * scale_f32;
++            float f1 = (float)(((int)(packed >> 4) ^ 8) - 8) * scale_f32;
++            uint32_t pk;
++            asm("v_cvt_pkrtz_f16_f32 %0, %1, %2" : "=v"(pk) : "v"(f0), "v"(f1));
++            dst[w * 4 + b] = pk;
++        }
++    }
++    o0 = make_uint4(dst[0], dst[1], dst[2], dst[3]);
++    o1 = make_uint4(dst[4], dst[5], dst[6], dst[7]);
++}
++
++// Unpack 8 packed bytes (= 16 C1 U4 values, FP32 affine scale & offset) -> 2x uint4 (= 16 f16s)
++__device__ __forceinline__ void unpack_c1_16_u4(
++    uint32_t p0, uint32_t p1, float s_val, float o_val, uint4 &o0, uint4 &o1
++) {
++    uint32_t dst[8];
++    const uint32_t words[2] = {p0, p1};
++    #pragma unroll
++    for (int w = 0; w < 2; ++w) {
++        uint32_t u = words[w];
++        #pragma unroll
++        for (int b = 0; b < 4; ++b) {
++            uint32_t packed = (u >> (b * 8)) & 0xFFu;
++            float f0 = fmaf((float)(packed & 15u), s_val, o_val);
++            float f1 = fmaf((float)(packed >> 4), s_val, o_val);
++            uint32_t pk;
++            asm("v_cvt_pkrtz_f16_f32 %0, %1, %2" : "=v"(pk) : "v"(f0), "v"(f1));
++            dst[w * 4 + b] = pk;
++        }
++    }
++    o0 = make_uint4(dst[0], dst[1], dst[2], dst[3]);
++    o1 = make_uint4(dst[4], dst[5], dst[6], dst[7]);
++}
++
++// Unified K64 RDNA 3.5 WMMA kernel:
++//   MODE=0:  source NVFP4
++//   MODE=10: mixed NVFP4 (kind==0) + signed INT4 (kind==1)
++//   MODE=20: mixed NVFP4 (kind==0) + C1 (kind==2)
++//   MODE=2:  coda C1
++//   FUSED=0: plain projection -> BF16 [T, top_k, N]
++//   FUSED=1: fused softcap SwiGLU -> BF16 [T, top_k, N/2]
++//   FUSED=2: fused softcap SwiGLU -> FP16 [T, top_k, N/2] (exact BF16-rounded values for zero-cast w2!)
++//   X_IS_BF16=1: reads BF16 X directly and converts to FP16 in registers before LDS store (zero cast kernel!)
++template <int M_TILE, int W_M, int W_N, int FUSED, int TOKENS_DIV, int MODE, int X_IS_BF16>
++__global__ __launch_bounds__(32 * W_M * W_N, 2)
++void moe_wmma_k64_unified_kernel(
++    const uint16_t* __restrict__ X,          // BF16 or FP16 [T, K] or [T*top_k, K]
++    const uint32_t* __restrict__ Packed,     // [E, N/128, K/64, 128, 8] uint32
++    const uint32_t* __restrict__ Raw,        // [E, N/128, K/64, 128] uint32
++    const float* __restrict__ Outer,         // [E] fp32 (NVFP4)
++    const uint16_t* __restrict__ RowScale,   // [E, N] fp16 (C1)
++    const uint32_t* __restrict__ TableU32,   // [E, 256] uint32 = 2x fp16 (scale, offset) (C1)
++    const int32_t* __restrict__ Kinds,       // [E] int32 (Mixed)
++    const int32_t* __restrict__ Sorted,
++    const int32_t* __restrict__ Expert,
++    const int32_t* __restrict__ BlockIdxList,
++    const int32_t* __restrict__ CountPtr,
++    uint16_t* __restrict__ Y,
++    const float* __restrict__ Gamma,
++    int N, int K, int ROUTES, float gate_cap, float up_cap
++) {
++    const int active_blocks = *CountPtr;
++    if (active_blocks <= 0) return;
++
++    const int n_tiles_grid = N >> 7;
++    int pid = blockIdx.x;
++    int grp_m = pid / (n_tiles_grid * 4);
++    int rem = pid % (n_tiles_grid * 4);
++    int n_blk = rem / 4;
++    int list_idx = grp_m * 4 + (rem & 3);
++    if (list_idx >= active_blocks) return;
++
++    const int m64_idx = BlockIdxList[list_idx];
++    const int expert = Expert[m64_idx];
++    if (expert < 0) return;
++
++    int kind = MODE;
++    if constexpr (MODE == 10 || MODE == 20) {
++        kind = Kinds[expert];
++    }
++
++    constexpr int N_TILE = 128;
++    constexpr int K_STRIDE = 72;  // 64 + 8 f16 pad = 36 dwords -> zero b128 bank conflicts
++    constexpr int N_THREADS = 32 * W_M * W_N;
++    constexpr int WM_ROWS = M_TILE / W_M;
++    constexpr int WN_COLS = N_TILE / W_N;
++    constexpr int BM = WM_ROWS / 16;
++    constexpr int BN = WN_COLS / 16;
++
++    __shared__ uint16_t smem_A[M_TILE * K_STRIDE];
++    __shared__ uint16_t smem_B[N_TILE * K_STRIDE];
++    __shared__ int smem_route[M_TILE];
++
++    const int tid = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int wm = warp / W_N;
++    const int wn = warp % W_N;
++    const int lane16 = lane & 15;
++    const int half_lane = lane >> 4;
++
++    const int sorted_base = m64_idx * 64;
++    for (int i = tid; i < M_TILE; i += N_THREADS) {
++        smem_route[i] = Sorted[sorted_base + i];
++    }
++    __syncthreads();
++
++    constexpr int A_CHUNKS_PER_ROW = 8;
++    constexpr int A_ITERS = (M_TILE * A_CHUNKS_PER_ROW) / N_THREADS;
++    const uint16_t* a_ptr[A_ITERS];
++    int a_smem_off[A_ITERS];
++    bool a_valid[A_ITERS];
++    #pragma unroll
++    for (int it = 0; it < A_ITERS; ++it) {
++        int idx = it * N_THREADS + tid;
++        int r = idx / A_CHUNKS_PER_ROW;
++        int c = (idx % A_CHUNKS_PER_ROW) * 8;
++        int route = smem_route[r];
++        a_valid[it] = (route >= 0 && route < ROUTES);
++        a_ptr[it] = a_valid[it] ? (X + (int64_t)(route / TOKENS_DIV) * K + c) : nullptr;
++        a_smem_off[it] = r * K_STRIDE + c;
++    }
++
++    constexpr int B_CHUNKS_PER_ROW = 4;
++    constexpr int B_ITERS = (N_TILE * B_CHUNKS_PER_ROW) / N_THREADS;
++    const int n_bank_tiles = N >> 7;
++    const int k_bank_tiles = K >> 6;
++    const uint32_t* b_pack_base[B_ITERS];
++    const uint32_t* b_raw_base[B_ITERS];
++    float b_row_scale[B_ITERS];
++    int b_kk[B_ITERS];
++    int b_smem_off[B_ITERS];
++    #pragma unroll
++    for (int it = 0; it < B_ITERS; ++it) {
++        int idx = it * N_THREADS + tid;
++        int r = idx / B_CHUNKS_PER_ROW;
++        int kk = idx % B_CHUNKS_PER_ROW;
++        int col = n_blk * 128 + r;
++        int64_t tile0 = ((int64_t)expert * n_bank_tiles + n_blk) * k_bank_tiles;
++        b_raw_base[it] = Raw + tile0 * 128 + r;
++        b_pack_base[it] = Packed + (tile0 * 128 + r) * 8 + kk * 2;
++        b_kk[it] = kk;
++        b_smem_off[it] = r * K_STRIDE + kk * 16;
++        if constexpr (MODE == 2 || MODE == 20) {
++            b_row_scale[it] = (kind == 2) ? f16_bits_to_f32(RowScale[(int64_t)expert * N + col]) : 1.0f;
++        }
++    }
++
++    const uint32_t* tab_e = (MODE == 2 || MODE == 20) ? (TableU32 + (int64_t)expert * 256) : nullptr;
++
++    float8 acc[BM][BN];
++    #pragma unroll
++    for (int im = 0; im < BM; ++im)
++        #pragma unroll
++        for (int in = 0; in < BN; ++in)
++            acc[im][in] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++
++    uint4 reg_a[A_ITERS];
++    uint2 reg_p[B_ITERS];
++    uint32_t reg_raw[B_ITERS];
++
++    auto prefetch = [&](int kt) {
++        int k_off = kt << 6;
++        #pragma unroll
++        for (int it = 0; it < A_ITERS; ++it) {
++            reg_a[it] = a_valid[it]
++                ? *reinterpret_cast<const uint4*>(a_ptr[it] + k_off)
++                : make_uint4(0, 0, 0, 0);
++        }
++        #pragma unroll
++        for (int it = 0; it < B_ITERS; ++it) {
++            reg_raw[it] = b_raw_base[it][kt * 128];
++            reg_p[it] = *reinterpret_cast<const uint2*>(b_pack_base[it] + (int64_t)kt * (128 * 8));
++        }
++    };
++
++    prefetch(0);
++    for (int kt = 0; kt < k_bank_tiles; ++kt) {
++        #pragma unroll
++        for (int it = 0; it < A_ITERS; ++it) {
++            uint4 val = X_IS_BF16 ? bf16x8_to_f16x8(reg_a[it]) : reg_a[it];
++            *reinterpret_cast<uint4*>(smem_A + a_smem_off[it]) = val;
++        }
++        #pragma unroll
++        for (int it = 0; it < B_ITERS; ++it) {
++            uint4 o0, o1;
++            if (kind == 0) {
++                uint32_t scale_byte = (reg_raw[it] >> (b_kk[it] * 8)) & 0xFFu;
++                unpack_nvfp4_16_u4(reg_p[it].x, reg_p[it].y, scale_byte, o0, o1);
++            } else if (kind == 1) {
++                uint16_t s_bf16 = (b_kk[it] < 2)
++                    ? (uint16_t)(reg_raw[it] & 0xFFFFu)
++                    : (uint16_t)(reg_raw[it] >> 16);
++                unpack_int4_16_u4(reg_p[it].x, reg_p[it].y, bf16_to_f32(s_bf16), o0, o1);
++            } else {
++                uint32_t tag = (reg_raw[it] >> (b_kk[it] * 8)) & 0xFFu;
++                uint32_t entry = tab_e[tag];
++                float s_val = f16_bits_to_f32((uint16_t)(entry & 0xFFFFu)) * b_row_scale[it];
++                float o_val = f16_bits_to_f32((uint16_t)(entry >> 16)) * b_row_scale[it];
++                unpack_c1_16_u4(reg_p[it].x, reg_p[it].y, s_val, o_val, o0, o1);
++            }
++            uint4* sp = reinterpret_cast<uint4*>(smem_B + b_smem_off[it]);
++            sp[0] = o0;
++            sp[1] = o1;
++        }
++        __syncthreads();
++
++        if (kt + 1 < k_bank_tiles) {
++            prefetch(kt + 1);
++        }
++
++        #pragma unroll
++        for (int kk = 0; kk < 64; kk += 16) {
++            half16 a_frag[BM];
++            #pragma unroll
++            for (int im = 0; im < BM; ++im) {
++                int row = wm * WM_ROWS + im * 16 + lane16;
++                const uint4* ap = reinterpret_cast<const uint4*>(smem_A + row * K_STRIDE + kk);
++                uint4 pair[2] = {ap[0], ap[1]};
++                __builtin_memcpy(&a_frag[im], pair, sizeof(half16));
++            }
++            #pragma unroll
++            for (int in = 0; in < BN; ++in) {
++                int col = wn * WN_COLS + in * 16 + lane16;
++                const uint4* bp = reinterpret_cast<const uint4*>(smem_B + col * K_STRIDE + kk);
++                uint4 pair[2] = {bp[0], bp[1]};
++                half16 b_frag;
++                __builtin_memcpy(&b_frag, pair, sizeof(half16));
++                #pragma unroll
++                for (int im = 0; im < BM; ++im) {
++                    acc[im][in] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag[im], b_frag, acc[im][in]);
++                }
++            }
++        }
++        __syncthreads();
++    }
++
++    const float outer = (kind == 0) ? Outer[expert] : 1.0f;
++    const float inv_g = (FUSED != 0) ? (1.0f / gate_cap) : 0.0f;
++    const float inv_u = (FUSED != 0) ? (1.0f / up_cap) : 0.0f;
++    const int n_col_base = n_blk * 128 + wn * WN_COLS;
++    #pragma unroll
++    for (int im = 0; im < BM; ++im) {
++        int m_base = wm * WM_ROWS + im * 16;
++        #pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            int row_in_blk = half_lane + 2 * i;
++            int r = smem_route[m_base + row_in_blk];
++            if (r < 0 || r >= ROUTES) continue;
++            if constexpr (FUSED) {
++                float gam = Gamma[r];
++                #pragma unroll
++                for (int in = 0; in < BN; ++in) {
++                    float v = bf16_round_f32(acc[im][in][i] * outer);
++                    float up_v = __shfl_xor(v, 1, 32);
++                    uint16_t h_val = 0;
++                    if ((lane16 & 1) == 0) {
++                        float mid = gate_cap * fast_tanh_hw(v * inv_g) * fast_sigmoid_hw(v)
++                                  * up_cap * fast_tanh_hw(up_v * inv_u) * gam;
++                        if constexpr (FUSED == 2) {
++                            _Float16 h = (_Float16)bf16_round_f32(mid);
++                            h_val = *reinterpret_cast<uint16_t*>(&h);
++                        } else {
++                            h_val = f32_to_bf16_rtne(mid);
++                        }
++                    }
++                    uint32_t next_h = __shfl_down((uint32_t)h_val, 2, 16);
++                    if ((lane16 & 3) == 0) {
++                        uint32_t pk = (uint32_t)h_val | (next_h << 16);
++                        int col_out = (n_col_base + in * 16 + lane16) >> 1;
++                        *reinterpret_cast<uint32_t*>(Y + (int64_t)r * (N >> 1) + col_out) = pk;
++                    }
++                }
++            } else {
++                #pragma unroll
++                for (int in = 0; in < BN; ++in) {
++                    uint16_t h0 = f32_to_bf16_rtne(acc[im][in][i] * outer);
++                    uint32_t h1 = __shfl_down((uint32_t)h0, 1, 16);
++                    if ((lane16 & 1) == 0) {
++                        uint32_t pk = (uint32_t)h0 | (h1 << 16);
++                        int col_out = n_col_base + in * 16 + lane16;
++                        *reinterpret_cast<uint32_t*>(Y + (int64_t)r * N + col_out) = pk;
++                    }
++                }
++            }
++        }
++    }
++}
++
++// ============================================================================
++// 2. 1-WARP (ZERO-BARRIER, ZERO-LDS, uint2 COALESCED) FUSED K+V SHORT-CONV
++//    Handles BOTH K and V in ONE launch! D=128 -> 32 lanes x 4 bf16 (uint2 = 8B)
++//    Block = (128,) = 4 independent warps (each warp owns 1 (t_tile, head)!)
++// ============================================================================
++template <int BT, int DYNAMIC>
++__global__ __launch_bounds__(128, 4)
++void hip_kv_conv_1warp_kernel(
++    const uint16_t* __restrict__ K_in,
++    const uint16_t* __restrict__ V_in,
++    const uint16_t* __restrict__ Wk,
++    const uint16_t* __restrict__ Wv,
++    const uint16_t* __restrict__ Dk,
++    const uint16_t* __restrict__ Dv,
++    uint16_t* __restrict__ ConvCache,
++    uint16_t* __restrict__ KeyCache,
++    uint16_t* __restrict__ ValCache,
++    const int64_t* __restrict__ KvSlots,
++    const int32_t* __restrict__ Pos,
++    const int32_t* __restrict__ SeqIdx,
++    const int64_t* __restrict__ ConvSlots,
++    const int32_t* __restrict__ BlockTable,
++    const int32_t* __restrict__ QStart,
++    int T, int KVH, int64_t stride_k, int64_t stride_v,
++    int64_t stride_w0, int64_t stride_w1, int64_t stride_dk, int64_t stride_dv,
++    int64_t stride_c_blk, int64_t stride_c_h, int64_t stride_c_n,
++    int64_t stride_kv_blk, int64_t stride_kv_n, int64_t stride_kv_h,
++    int kv_block_size, int64_t stride_bt, int max_blocks, int N_conv,
++    float scale, float clip_threshold, float clip_eps, float norm_eps
++) {
++    const int warp = threadIdx.x >> 5;
++    const int lane = threadIdx.x & 31;
++    const int tile_idx = blockIdx.x * 4 + warp;
++    const int n_tiles = (T + BT - 1) / BT;
++    if (tile_idx >= n_tiles) return;
++    const int t0 = tile_idx * BT;
++    const int head = blockIdx.y;
++    const int d0 = lane * 4;
++    const int col0 = head * 128 + d0;
++
++    float wk_s[4][4], wv_s[4][4];
++    #pragma unroll
++    for (int lag = 0; lag < 4; ++lag) {
++        if constexpr (DYNAMIC) {
++            uint2 pk = *reinterpret_cast<const uint2*>(Wk + lag * stride_w0 + col0 * stride_w1);
++            uint2 pv = *reinterpret_cast<const uint2*>(Wv + lag * stride_w0 + col0 * stride_w1);
++            wk_s[lag][0] = bf16_to_f32(pk.x & 0xFFFFu); wk_s[lag][1] = bf16_to_f32(pk.x >> 16);
++            wk_s[lag][2] = bf16_to_f32(pk.y & 0xFFFFu); wk_s[lag][3] = bf16_to_f32(pk.y >> 16);
++            wv_s[lag][0] = bf16_to_f32(pv.x & 0xFFFFu); wv_s[lag][1] = bf16_to_f32(pv.x >> 16);
++            wv_s[lag][2] = bf16_to_f32(pv.y & 0xFFFFu); wv_s[lag][3] = bf16_to_f32(pv.y >> 16);
++        } else {
++            int k_idx = 3 - lag;
++            #pragma unroll
++            for (int c = 0; c < 4; ++c) {
++                wk_s[lag][c] = bf16_to_f32(Wk[(col0 + c) * stride_w0 + k_idx * stride_w1]);
++                wv_s[lag][c] = bf16_to_f32(Wv[(col0 + c) * stride_w0 + k_idx * stride_w1]);
++            }
++        }
++    }
++
++    auto load_u2_f32 = [](const uint16_t* p, float out[4]) {
++        uint2 u = *reinterpret_cast<const uint2*>(p);
++        out[0] = bf16_to_f32(u.x & 0xFFFFu); out[1] = bf16_to_f32(u.x >> 16);
++        out[2] = bf16_to_f32(u.y & 0xFFFFu); out[3] = bf16_to_f32(u.y >> 16);
++    };
++
++    float kh[3][4] = {{0.f}}, vh[3][4] = {{0.f}};
++    const int qst0 = QStart[t0];
++    const int pos0 = Pos[t0];
++    const int req0 = SeqIdx[t0];
++    if (ConvSlots[t0] >= 0) {
++        #pragma unroll
++        for (int h_i = 0; h_i < 3; ++h_i) {
++            int lag = 3 - h_i;
++            int row = t0 - lag;
++            int src = pos0 - lag;
++            if (src >= 0) {
++                if (row >= qst0) {
++                    load_u2_f32(K_in + (int64_t)row * stride_k + col0, kh[h_i]);
++                    load_u2_f32(V_in + (int64_t)row * stride_v + col0, vh[h_i]);
++                } else {
++                    int blk_i = min(src / N_conv, max_blocks - 1);
++                    int64_t pblk = BlockTable[(int64_t)req0 * stride_bt + blk_i];
++                    int64_t c_off = pblk * stride_c_blk + (int64_t)(src % N_conv) * stride_c_n + (int64_t)head * stride_c_h + d0;
++                    load_u2_f32(ConvCache + c_off, kh[h_i]);
++                    load_u2_f32(ConvCache + c_off + 128, vh[h_i]);
++                }
++            }
++        }
++    }
++
++    const int t_end = min(t0 + BT, T);
++    for (int t = t0; t < t_end; ++t) {
++        int64_t cslot = ConvSlots[t];
++        int qst = QStart[t];
++        int pos = Pos[t];
++        int req = SeqIdx[t];
++        if (t > t0 && qst == t) {
++            #pragma unroll
++            for (int h_i = 0; h_i < 3; ++h_i) {
++                int lag = 3 - h_i;
++                int src = pos - lag;
++                if (cslot >= 0 && src >= 0) {
++                    int blk_i = min(src / N_conv, max_blocks - 1);
++                    int64_t pblk = BlockTable[(int64_t)req * stride_bt + blk_i];
++                    int64_t c_off = pblk * stride_c_blk + (int64_t)(src % N_conv) * stride_c_n + (int64_t)head * stride_c_h + d0;
++                    load_u2_f32(ConvCache + c_off, kh[h_i]);
++                    load_u2_f32(ConvCache + c_off + 128, vh[h_i]);
++                } else {
++                    #pragma unroll
++                    for (int c = 0; c < 4; ++c) { kh[h_i][c] = 0.f; vh[h_i][c] = 0.f; }
++                }
++            }
++        }
++
++        uint2 ku = *reinterpret_cast<const uint2*>(K_in + (int64_t)t * stride_k + col0);
++        uint2 vu = *reinterpret_cast<const uint2*>(V_in + (int64_t)t * stride_v + col0);
++        float kc[4] = {bf16_to_f32(ku.x & 0xFFFFu), bf16_to_f32(ku.x >> 16), bf16_to_f32(ku.y & 0xFFFFu), bf16_to_f32(ku.y >> 16)};
++        float vc[4] = {bf16_to_f32(vu.x & 0xFFFFu), bf16_to_f32(vu.x >> 16), bf16_to_f32(vu.y & 0xFFFFu), bf16_to_f32(vu.y >> 16)};
++
++        if (cslot >= 0) {
++            int64_t c_off = (cslot / N_conv) * stride_c_blk + (cslot % N_conv) * stride_c_n + (int64_t)head * stride_c_h + d0;
++            *reinterpret_cast<uint2*>(ConvCache + c_off) = ku;
++            *reinterpret_cast<uint2*>(ConvCache + c_off + 128) = vu;
++        }
++
++        float dk[4], dv[4];
++        if constexpr (DYNAMIC) {
++            uint2 dku = *reinterpret_cast<const uint2*>(Dk + (int64_t)t * stride_dk + head * 4);
++            uint2 dvu = *reinterpret_cast<const uint2*>(Dv + (int64_t)t * stride_dv + head * 4);
++            dk[0] = bf16_to_f32(dku.x & 0xFFFFu); dk[1] = bf16_to_f32(dku.x >> 16);
++            dk[2] = bf16_to_f32(dku.y & 0xFFFFu); dk[3] = bf16_to_f32(dku.y >> 16);
++            dv[0] = bf16_to_f32(dvu.x & 0xFFFFu); dv[1] = bf16_to_f32(dvu.x >> 16);
++            dv[2] = bf16_to_f32(dvu.y & 0xFFFFu); dv[3] = bf16_to_f32(dvu.y >> 16);
++        }
++
++        float ky[4], vy[4];
++        float ksq = 0.f, vsq = 0.f;
++        bool valid = (cslot >= 0);
++        #pragma unroll
++        for (int c = 0; c < 4; ++c) {
++            float ka, va;
++            if (valid) {
++                if constexpr (DYNAMIC) {
++                    ka = kc[c] * (wk_s[0][c] + dk[0]);
++                    ka = fmaf(kh[2][c], wk_s[1][c] + dk[1], ka);
++                    ka = fmaf(kh[1][c], wk_s[2][c] + dk[2], ka);
++                    ka = fmaf(kh[0][c], wk_s[3][c] + dk[3], ka);
++                    va = vc[c] * (wv_s[0][c] + dv[0]);
++                    va = fmaf(vh[2][c], wv_s[1][c] + dv[1], va);
++                    va = fmaf(vh[1][c], wv_s[2][c] + dv[2], va);
++                    va = fmaf(vh[0][c], wv_s[3][c] + dv[3], va);
++                } else {
++                    ka = kh[0][c] * wk_s[3][c];
++                    ka = fmaf(kh[1][c], wk_s[2][c], ka);
++                    ka = fmaf(kh[2][c], wk_s[1][c], ka);
++                    ka = fmaf(kc[c], wk_s[0][c], ka);
++                    va = vh[0][c] * wv_s[3][c];
++                    va = fmaf(vh[1][c], wv_s[2][c], va);
++                    va = fmaf(vh[2][c], wv_s[1][c], va);
++                    va = fmaf(vc[c], wv_s[0][c], va);
++                }
++            } else {
++                ka = 0.f; va = 0.f;
++            }
++            ky[c] = bf16_to_f32(f32_to_bf16_rtne((ka + kc[c]) * scale));
++            vy[c] = bf16_to_f32(f32_to_bf16_rtne((va + vc[c]) * scale));
++            ksq += ky[c] * ky[c];
++            vsq += vy[c] * vy[c];
++            kh[0][c] = kh[1][c]; kh[1][c] = kh[2][c]; kh[2][c] = kc[c];
++            vh[0][c] = vh[1][c]; vh[1][c] = vh[2][c]; vh[2][c] = vc[c];
++        }
++
++        #pragma unroll
++        for (int off = 16; off > 0; off >>= 1) {
++            ksq += __shfl_xor(ksq, off, 32);
++            vsq += __shfl_xor(vsq, off, 32);
++        }
++        float k_norm = (ksq > 0.f) ? (ksq * rsqrtf(ksq)) : 0.f;
++        float k_sc = fminf(clip_threshold / (k_norm + clip_eps), 1.0f);
++        float v_sc = rsqrtf(vsq * (1.0f / 128.0f) + norm_eps);
++
++        int64_t kv_slot = KvSlots[t];
++        if (kv_slot >= 0) {
++            int64_t kv_off = (kv_slot / kv_block_size) * stride_kv_blk + (kv_slot % kv_block_size) * stride_kv_n + (int64_t)head * stride_kv_h + d0;
++            uint2 ko = make_uint2(pack_bf16x2(ky[0] * k_sc, ky[1] * k_sc), pack_bf16x2(ky[2] * k_sc, ky[3] * k_sc));
++            uint2 vo = make_uint2(pack_bf16x2(vy[0] * v_sc, vy[1] * v_sc), pack_bf16x2(vy[2] * v_sc, vy[3] * v_sc));
++            *reinterpret_cast<uint2*>(KeyCache + kv_off) = ko;
++            *reinterpret_cast<uint2*>(ValCache + kv_off) = vo;
++        }
++    }
++}
++
++// ============================================================================
++// 3. ZERO-MATERIALIZATION 4-QUERY ATTN_RES MESSAGE COEFFICIENTS (D=2304, N_STACK=1)
++//    Produces Coeffs[4, T, 2] FP32 so loop blend reconstructs exact FP32 messages
++//    on the fly from BF16 Bank0/Bank1 without allocating or writing 141 MB FP32!
++// ============================================================================
++__global__ __launch_bounds__(288, 4)
++void hip_attn_res_q4_coeffs_kernel(
++    const uint16_t* __restrict__ Bank0,
++    const uint16_t* __restrict__ Bank1,
++    const float* __restrict__ Queries,
++    float* __restrict__ Coeffs,
++    int64_t sb0, int64_t sb1, int64_t sq,
++    int T, float eps
++) {
++    const int t = blockIdx.x;
++    if (t >= T) return;
++    const int tid = threadIdx.x;
++    const int c0 = tid * 8;
++
++    uint4 u0 = *reinterpret_cast<const uint4*>(Bank0 + (int64_t)t * sb0 + c0);
++    uint4 u1 = *reinterpret_cast<const uint4*>(Bank1 + (int64_t)t * sb1 + c0);
++    float b0[8] = {
++        bf16_to_f32(u0.x & 0xFFFFu), bf16_to_f32(u0.x >> 16),
++        bf16_to_f32(u0.y & 0xFFFFu), bf16_to_f32(u0.y >> 16),
++        bf16_to_f32(u0.z & 0xFFFFu), bf16_to_f32(u0.z >> 16),
++        bf16_to_f32(u0.w & 0xFFFFu), bf16_to_f32(u0.w >> 16),
++    };
++    float b1[8] = {
++        bf16_to_f32(u1.x & 0xFFFFu), bf16_to_f32(u1.x >> 16),
++        bf16_to_f32(u1.y & 0xFFFFu), bf16_to_f32(u1.y >> 16),
++        bf16_to_f32(u1.z & 0xFFFFu), bf16_to_f32(u1.z >> 16),
++        bf16_to_f32(u1.w & 0xFFFFu), bf16_to_f32(u1.w >> 16),
++    };
++
++    float s0 = 0.f, s1 = 0.f;
++    float d0[4] = {0.f, 0.f, 0.f, 0.f}, d1[4] = {0.f, 0.f, 0.f, 0.f};
++    #pragma unroll
++    for (int j = 0; j < 8; ++j) {
++        s0 = fmaf(b0[j], b0[j], s0);
++        s1 = fmaf(b1[j], b1[j], s1);
++    }
++    #pragma unroll
++    for (int qi = 0; qi < 4; ++qi) {
++        float4 qa = *reinterpret_cast<const float4*>(Queries + (int64_t)qi * sq + c0);
++        float4 qb = *reinterpret_cast<const float4*>(Queries + (int64_t)qi * sq + c0 + 4);
++        d0[qi] = qa.x*b0[0] + qa.y*b0[1] + qa.z*b0[2] + qa.w*b0[3] + qb.x*b0[4] + qb.y*b0[5] + qb.z*b0[6] + qb.w*b0[7];
++        d1[qi] = qa.x*b1[0] + qa.y*b1[1] + qa.z*b1[2] + qa.w*b1[3] + qb.x*b1[4] + qb.y*b1[5] + qb.z*b1[6] + qb.w*b1[7];
++    }
++
++    #pragma unroll
++    for (int off = 16; off > 0; off >>= 1) {
++        s0 += __shfl_xor(s0, off, 32);
++        s1 += __shfl_xor(s1, off, 32);
++        #pragma unroll
++        for (int qi = 0; qi < 4; ++qi) {
++            d0[qi] += __shfl_xor(d0[qi], off, 32);
++            d1[qi] += __shfl_xor(d1[qi], off, 32);
++        }
++    }
++
++    __shared__ float sm[9][10];
++    int warp = tid >> 5, lane = tid & 31;
++    if (lane == 0) {
++        sm[warp][0] = s0; sm[warp][1] = s1;
++        #pragma unroll
++        for (int qi = 0; qi < 4; ++qi) {
++            sm[warp][2 + qi] = d0[qi];
++            sm[warp][6 + qi] = d1[qi];
++        }
++    }
++    __syncthreads();
++
++    if (tid == 0) {
++        float ts0 = 0.f, ts1 = 0.f;
++        float td0[4] = {0.f, 0.f, 0.f, 0.f}, td1[4] = {0.f, 0.f, 0.f, 0.f};
++        #pragma unroll
++        for (int w = 0; w < 9; ++w) {
++            ts0 += sm[w][0]; ts1 += sm[w][1];
++            #pragma unroll
++            for (int qi = 0; qi < 4; ++qi) {
++                td0[qi] += sm[w][2 + qi];
++                td1[qi] += sm[w][6 + qi];
++            }
++        }
++        float r0 = rsqrtf(ts0 * (1.0f / 2304.0f) + eps);
++        float r1 = rsqrtf(ts1 * (1.0f / 2304.0f) + eps);
++        #pragma unroll
++        for (int qi = 0; qi < 4; ++qi) {
++            float l0 = td0[qi] * r0;
++            float l1 = td1[qi] * r1;
++            float m = fmaxf(l0, l1);
++            float e0 = expf(l0 - m);
++            float e1 = expf(l1 - m);
++            float inv = 1.0f / (e0 + e1);
++            Coeffs[((int64_t)qi * T + t) * 2 + 0] = (e0 * inv) * r0;
++            Coeffs[((int64_t)qi * T + t) * 2 + 1] = (e1 * inv) * r1;
++        }
++    }
++}
++
++extern "C" {
++
++void launch_pair_m64(
++    const void* Expert, const void* Padded, void* PairIdx, void* TailIdx, void* Counts,
++    int max_blocks, hipStream_t stream
++) {
++    hipLaunchKernelGGL(
++        pair_m64_blocks_kernel, dim3(1), dim3(32), 0, stream,
++        (const int32_t*)Expert, (const int32_t*)Padded,
++        (int32_t*)PairIdx, (int32_t*)TailIdx, (int32_t*)Counts, max_blocks);
++}
++
++#define DEF_PAIRED_LAUNCH(NAME, MODE, FUSED, TDIV, XBF16) \
++void NAME( \
++    const void* X, const void* Packed, const void* Raw, const void* Outer, \
++    const void* RowScale, const void* TableU32, const void* Kinds, \
++    const void* Sorted, const void* Expert, \
++    const void* PairIdx, const void* TailIdx, const void* Counts, \
++    void* Y, const void* Gamma, \
++    int N, int K, int ROUTES, int max_m64_blocks, float gate_cap, float up_cap, hipStream_t stream \
++) { \
++    int max_pairs = max_m64_blocks / 2 + 1; \
++    int max_tails = min(max_m64_blocks, 128); \
++    dim3 grid_p(((max_pairs + 3) / 4) * 4 * (N / 128), 1); \
++    hipLaunchKernelGGL( \
++        (moe_wmma_k64_unified_kernel<128, 2, 4, FUSED, TDIV, MODE, XBF16>), grid_p, dim3(256), 0, stream, \
++        (const uint16_t*)X, (const uint32_t*)Packed, (const uint32_t*)Raw, (const float*)Outer, \
++        (const uint16_t*)RowScale, (const uint32_t*)TableU32, (const int32_t*)Kinds, \
++        (const int32_t*)Sorted, (const int32_t*)Expert, (const int32_t*)PairIdx, (const int32_t*)Counts, \
++        (uint16_t*)Y, (const float*)Gamma, N, K, ROUTES, gate_cap, up_cap); \
++    dim3 grid_t(((max_tails + 3) / 4) * 4 * (N / 128), 1); \
++    hipLaunchKernelGGL( \
++        (moe_wmma_k64_unified_kernel<64, 1, 4, FUSED, TDIV, MODE, XBF16>), grid_t, dim3(128), 0, stream, \
++        (const uint16_t*)X, (const uint32_t*)Packed, (const uint32_t*)Raw, (const float*)Outer, \
++        (const uint16_t*)RowScale, (const uint32_t*)TableU32, (const int32_t*)Kinds, \
++        (const int32_t*)Sorted, (const int32_t*)Expert, (const int32_t*)TailIdx, ((const int32_t*)Counts) + 1, \
++        (uint16_t*)Y, (const float*)Gamma, N, K, ROUTES, gate_cap, up_cap); \
++}
++
++// BF16-direct X input variants for w13 (zero x.to(float16) overhead!)
++DEF_PAIRED_LAUNCH(launch_source_w13_f16_xbf16,   0, 2, 8, 1)
++DEF_PAIRED_LAUNCH(launch_source_w13_bf16_xbf16,  0, 1, 8, 1)
++DEF_PAIRED_LAUNCH(launch_mixed1_w13_f16_xbf16,  10, 2, 8, 1)
++DEF_PAIRED_LAUNCH(launch_mixed1_w13_bf16_xbf16, 10, 1, 8, 1)
++DEF_PAIRED_LAUNCH(launch_mixed2_w13_f16_xbf16,  20, 2, 8, 1)
++DEF_PAIRED_LAUNCH(launch_mixed2_w13_bf16_xbf16, 20, 1, 8, 1)
++DEF_PAIRED_LAUNCH(launch_coda_w13_f16_xbf16,     2, 2, 8, 1)
++DEF_PAIRED_LAUNCH(launch_coda_w13_bf16_xbf16,    2, 1, 8, 1)
++
++// FP16 X input variants (w13 if X already FP16, and w2 consuming w13's FP16 output!)
++DEF_PAIRED_LAUNCH(launch_source_w13_f16,   0, 2, 8, 0)
++DEF_PAIRED_LAUNCH(launch_source_w13_bf16,  0, 1, 8, 0)
++DEF_PAIRED_LAUNCH(launch_source_w2,        0, 0, 1, 0)
++DEF_PAIRED_LAUNCH(launch_mixed1_w13_f16,  10, 2, 8, 0)
++DEF_PAIRED_LAUNCH(launch_mixed1_w13_bf16, 10, 1, 8, 0)
++DEF_PAIRED_LAUNCH(launch_mixed1_w2,       10, 0, 1, 0)
++DEF_PAIRED_LAUNCH(launch_mixed2_w13_f16,  20, 2, 8, 0)
++DEF_PAIRED_LAUNCH(launch_mixed2_w13_bf16, 20, 1, 8, 0)
++DEF_PAIRED_LAUNCH(launch_mixed2_w2,       20, 0, 1, 0)
++DEF_PAIRED_LAUNCH(launch_coda_w13_f16,     2, 2, 8, 0)
++DEF_PAIRED_LAUNCH(launch_coda_w13_bf16,    2, 1, 8, 0)
++DEF_PAIRED_LAUNCH(launch_coda_w2,          2, 0, 1, 0)
++
++void launch_hip_kv_conv_1w(
++    const void* K, const void* V, const void* Wk, const void* Wv, const void* Dk, const void* Dv,
++    void* CC, void* KC, void* VC, const void* KVS, const void* Pos, const void* Seq, const void* CS,
++    const void* BT_ptr, const void* QS,
++    int T, int KVH, int64_t sk, int64_t sv, int64_t sw0, int64_t sw1, int64_t sdk, int64_t sdv,
++    int64_t scb, int64_t sch, int64_t scn, int64_t skvb, int64_t skvn, int64_t skvh,
++    int kv_bs, int64_t sbt, int mb, int nc, float scale, float ct, float ce, float ne,
++    int dynamic, hipStream_t stream
++) {
++    constexpr int BT = 64;
++    int n_tiles = (T + BT - 1) / BT;
++    dim3 grid((n_tiles + 3) / 4, KVH);
++    dim3 block(128);
++    if (dynamic) {
++        hipLaunchKernelGGL((hip_kv_conv_1warp_kernel<BT, 1>), grid, block, 0, stream,
++            (const uint16_t*)K, (const uint16_t*)V, (const uint16_t*)Wk, (const uint16_t*)Wv,
++            (const uint16_t*)Dk, (const uint16_t*)Dv, (uint16_t*)CC, (uint16_t*)KC, (uint16_t*)VC,
++            (const int64_t*)KVS, (const int32_t*)Pos, (const int32_t*)Seq, (const int64_t*)CS,
++            (const int32_t*)BT_ptr, (const int32_t*)QS, T, KVH, sk, sv, sw0, sw1, sdk, sdv,
++            scb, sch, scn, skvb, skvn, skvh, kv_bs, sbt, mb, nc, scale, ct, ce, ne);
++    } else {
++        hipLaunchKernelGGL((hip_kv_conv_1warp_kernel<BT, 0>), grid, block, 0, stream,
++            (const uint16_t*)K, (const uint16_t*)V, (const uint16_t*)Wk, (const uint16_t*)Wv,
++            (const uint16_t*)Dk, (const uint16_t*)Dv, (uint16_t*)CC, (uint16_t*)KC, (uint16_t*)VC,
++            (const int64_t*)KVS, (const int32_t*)Pos, (const int32_t*)Seq, (const int64_t*)CS,
++            (const int32_t*)BT_ptr, (const int32_t*)QS, T, KVH, sk, sv, sw0, sw1, sdk, sdv,
++            scb, sch, scn, skvb, skvn, skvh, kv_bs, sbt, mb, nc, scale, ct, ce, ne);
++    }
++}
++
++void launch_q4_coeffs(
++    const void* B0, const void* B1, const void* Q, void* C,
++    int64_t sb0, int64_t sb1, int64_t sq, int T, float eps, hipStream_t stream
++) {
++    hipLaunchKernelGGL(
++        hip_attn_res_q4_coeffs_kernel, dim3(T), dim3(288), 0, stream,
++        (const uint16_t*)B0, (const uint16_t*)B1, (const float*)Q, (float*)C,
++        sb0, sb1, sq, T, eps);
++}
++
++}
+diff --git a/vllm/models/inkling2/amd/ops/hip_moe_prefill.py b/vllm/models/inkling2/amd/ops/hip_moe_prefill.py
+new file mode 100644
+index 00000000..1abed2a0
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/hip_moe_prefill.py
+@@ -0,0 +1,528 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 CIRU AI.
++"""Loader & runtime wrappers for native RDNA 3.5 prefill kernels (MoE, KV-conv, AttnRes)."""
++
++from __future__ import annotations
++
++import ctypes
++import glob
++import hashlib
++import logging
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_HIP_LIB: ctypes.CDLL | None = None
++_HIP_INIT_DONE: bool = False
++_SCRATCH: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
++_LAST_PLAN: dict[torch.device, object] = {}
++
++
++def _preload_amdhip() -> None:
++    """Ensure libamdhip64.so.7 from the active ROCm Python env is globally visible."""
++    patterns = [
++        os.path.join(sys.prefix, "lib", "python*", "site-packages", "_rocm_sdk_core", "lib", "libamdhip64.so.7"),
++        os.path.join(sys.prefix, "lib", "python*", "site-packages", "_rocm_sdk_core", "lib", "libamdhip64.so"),
++        "/opt/rocm/lib/libamdhip64.so.7",
++        "/opt/rocm/lib/libamdhip64.so",
++    ]
++    rocm_path = os.getenv("ROCM_PATH") or os.getenv("ROCM_HOME")
++    if rocm_path:
++        patterns.insert(0, os.path.join(rocm_path, "lib", "libamdhip64.so.7"))
++    for pat in patterns:
++        for cand in sorted(glob.glob(pat)):
++            if os.path.isfile(cand):
++                try:
++                    ctypes.CDLL(cand, mode=ctypes.RTLD_GLOBAL)
++                    return
++                except OSError:
++                    pass
++
++
++def _find_hipcc() -> tuple[str | None, str | None]:
++    """Locate a ROCm hipcc binary that has device libraries alongside it."""
++    explicit = os.getenv("INKLING_AMD_HIPCC")
++    if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
++        return explicit, str(Path(explicit).resolve().parent.parent)
++
++    candidates: list[str] = []
++    for pattern in (
++        os.path.join(sys.prefix, "lib", "python*", "site-packages", "_rocm_sdk_devel", "bin", "hipcc"),
++        "/opt/rocm/bin/hipcc",
++    ):
++        candidates.extend(sorted(glob.glob(pattern)))
++    rocm_path = os.getenv("ROCM_PATH") or os.getenv("ROCM_HOME")
++    if rocm_path:
++        candidates.insert(0, os.path.join(rocm_path, "bin", "hipcc"))
++    in_path = shutil.which("hipcc")
++    if in_path:
++        candidates.append(in_path)
++
++    for cand in candidates:
++        if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
++            continue
++        rocm_root = str(Path(cand).resolve().parent.parent)
++        has_devlib = (
++            os.path.isdir(os.path.join(rocm_root, "amdgcn", "bitcode"))
++            or os.path.isdir(os.path.join(rocm_root, "lib", "llvm", "amdgcn", "bitcode"))
++            or os.path.isdir(os.path.join(rocm_root, "llvm", "amdgcn", "bitcode"))
++        )
++        if has_devlib:
++            return cand, rocm_root
++    return None, None
++
++
++def _detect_nix_cxx_flags() -> tuple[list[str], dict[str, str]]:
++    """Detect NixOS GCC/glibc include & library flags if clang cannot find <cmath>."""
++    extra_flags: list[str] = []
++    extra_env: dict[str, str] = {}
++    gxx = shutil.which("g++")
++    if not gxx:
++        return extra_flags, extra_env
++    resolved = os.path.realpath(gxx)
++    if "/nix/store/" not in resolved:
++        return extra_flags, extra_env
++
++    gcc_root = str(Path(resolved).parent.parent)
++    inc_dirs: list[str] = []
++    try:
++        proc = subprocess.run(
++            [resolved, "-E", "-x", "c++", "-", "-v"],
++            input="", text=True, capture_output=True, timeout=5,
++        )
++        in_block = False
++        for line in proc.stderr.splitlines():
++            if "#include <...> search starts here:" in line:
++                in_block = True
++                continue
++            if "End of search list." in line:
++                break
++            if in_block:
++                p = line.strip()
++                if p and os.path.isdir(p):
++                    inc_dirs.append(p)
++                    if "/include/c++/" in p and "-gcc-" in p:
++                        gcc_root = p.split("/include/c++/")[0]
++    except Exception:
++        pass
++    if inc_dirs:
++        cur = os.environ.get("CPLUS_INCLUDE_PATH", "")
++        extra_env["CPLUS_INCLUDE_PATH"] = ":".join(inc_dirs + ([cur] if cur else []))
++    extra_flags.append(f"--gcc-toolchain={gcc_root}")
++    for lib_name in ("libstdc++.so", "crti.o"):
++        try:
++            out = subprocess.check_output(
++                [resolved, f"-print-file-name={lib_name}"], text=True, timeout=5,
++            ).strip()
++            if out and os.path.isfile(out):
++                ldir = os.path.dirname(out)
++                if lib_name == "crti.o":
++                    extra_flags.append(f"-B{ldir}")
++                extra_flags.append(f"-L{ldir}")
++                if lib_name == "libstdc++.so":
++                    extra_flags.append(f"-Wl,-rpath,{ldir}")
++        except Exception:
++            pass
++    return extra_flags, extra_env
++
++
++def _get_hip_lib() -> ctypes.CDLL | None:
++    global _HIP_LIB, _HIP_INIT_DONE
++    if _HIP_INIT_DONE:
++        return _HIP_LIB
++    _HIP_INIT_DONE = True
++
++    if os.getenv("INKLING_AMD_HIP_PREFILL_MOE", "1") in ("0", "off", "false"):
++        return None
++    if not torch.cuda.is_available() or not torch.version.hip:
++        return None
++    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "").split(":")[0]
++    if arch != "gfx1151":
++        return None
++
++    src_path = Path(__file__).with_name("hip_moe_prefill.hip")
++    src_hash = hashlib.sha256(src_path.read_bytes()).hexdigest()[:12] if src_path.is_file() else None
++    so_name = f"hip_moe_prefill_{arch}_{src_hash}.so" if src_hash else f"hip_moe_prefill_{arch}.so"
++
++    _preload_amdhip()
++
++    # Tier 1: Prebuilt portable .so via env var or bundled alongside source (no hipcc needed)
++    prebuilt_candidates: list[Path] = []
++    explicit_so = os.getenv("INKLING_AMD_HIP_PREFILL_SO")
++    if explicit_so:
++        prebuilt_candidates.append(Path(explicit_so))
++    if src_hash:
++        prebuilt_candidates.append(Path(__file__).with_name(so_name))
++    for cand in prebuilt_candidates:
++        if cand.is_file():
++            try:
++                _HIP_LIB = ctypes.CDLL(str(cand))
++                logger.info("Loaded Inkling2 prebuilt native HIP prefill kernels: %s", cand.name)
++                return _HIP_LIB
++            except Exception as exc:
++                logger.warning("Failed to load prebuilt HIP prefill .so (%s): %s", cand, exc)
++
++    if not src_path.is_file() or not src_hash:
++        return None
++
++    # Tier 2: Cached or auto-JIT compiled .so via local hipcc
++    cache_dir = Path(os.getenv("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))) / "vllm" / "inkling2_hip"
++    cache_dir.mkdir(parents=True, exist_ok=True)
++    so_path = cache_dir / so_name
++
++    if not so_path.is_file():
++        hipcc, rocm_root = _find_hipcc()
++        if not hipcc:
++            logger.info("Inkling2 HIP prefill: hipcc with device libs not found; using Gluon/Triton fallback.")
++            return None
++        extra_flags, extra_env = _detect_nix_cxx_flags()
++        env = os.environ.copy()
++        env.update(extra_env)
++        if rocm_root:
++            env["ROCM_PATH"] = rocm_root
++            env["ROCM_HOME"] = rocm_root
++            env["HIP_PATH"] = rocm_root
++            extra_flags.extend([f"-L{rocm_root}/lib", f"-Wl,-rpath,{rocm_root}/lib"])
++        tmp_fd, tmp_so = tempfile.mkstemp(prefix=".hip_moe_", suffix=".so", dir=str(cache_dir))
++        os.close(tmp_fd)
++        cmd = [
++            hipcc, "-shared", "-fPIC", "-O3", f"--offload-arch={arch}",
++            "-Wl,--as-needed", str(src_path), "-o", tmp_so, *extra_flags,
++        ]
++        try:
++            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
++            if res.returncode != 0:
++                logger.warning("Inkling2 HIP prefill compile failed (using fallback): %s", res.stderr[-600:])
++                try:
++                    os.unlink(tmp_so)
++                except OSError:
++                    pass
++                return None
++            os.replace(tmp_so, str(so_path))
++        except Exception as exc:
++            logger.warning("Inkling2 HIP prefill build error (using fallback): %s", exc)
++            try:
++                os.unlink(tmp_so)
++            except OSError:
++                pass
++            return None
++
++    try:
++        _HIP_LIB = ctypes.CDLL(str(so_path))
++        logger.info("Loaded Inkling2 native HIP prefill kernels: %s", so_path.name)
++    except Exception as exc:
++        logger.warning("Failed to load Inkling2 HIP prefill .so (using fallback): %s", exc)
++        _HIP_LIB = None
++    return _HIP_LIB
++
++
++def _get_scratch(device: torch.device, max_m64: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    entry = _SCRATCH.get(device)
++    need_pairs = max_m64 // 2 + 2
++    need_tails = max_m64 + 2
++    if entry is None or entry[0].numel() < need_pairs or entry[1].numel() < need_tails:
++        pair_idx = torch.empty(max(need_pairs, 2048), device=device, dtype=torch.int32)
++        tail_idx = torch.empty(max(need_tails, 4096), device=device, dtype=torch.int32)
++        counts = torch.empty(2, device=device, dtype=torch.int32)
++        entry = (pair_idx, tail_idx, counts)
++        _SCRATCH[device] = entry
++        _LAST_PLAN.pop(device, None)
++    return entry
++
++
++def hip_moe_prefill_available() -> bool:
++    return _get_hip_lib() is not None
++
++
++def hip_moe_prefill_projection(
++    x: torch.Tensor,
++    bank,
++    plan,
++    *,
++    bank_kind: str,  # "source", "mixed", "coda"
++    fused_activation=None,
++    out_fp16: bool = False,
++) -> torch.Tensor | None:
++    """Run paired-M128 + M64-tail native HIP WMMA MoE prefill projection."""
++    lib = _get_hip_lib()
++    if lib is None or (plan.block_m, plan.block_n, plan.block_k) != (64, 128, 64):
++        return None
++    if plan.top_k != 8 or plan.num_experts != 128:
++        return None
++
++    experts, n_tiles, k_tiles, _, _ = bank.packed.shape
++    n, k = n_tiles * 128, k_tiles * 64
++    route_shape = (plan.num_tokens, plan.top_k)
++    gamma, gate_cap, up_cap = None, 0.0, 0.0
++    fused = fused_activation is not None
++    if fused:
++        gamma, gate_cap, up_cap = fused_activation
++
++    # Direct BF16 X-load on w13 avoids x.to(float16); w2 consumes FP16 directly from w13.
++    use_xbf16 = fused and x.dtype == torch.bfloat16
++    if use_xbf16:
++        x_in = x if x.is_contiguous() else x.contiguous()
++    else:
++        x_in = x if x.dtype == torch.float16 else x.to(torch.float16)
++        if not x_in.is_contiguous():
++            x_in = x_in.contiguous()
++
++    out_dtype = torch.float16 if (fused and out_fp16) else torch.bfloat16
++    out = x.new_empty((*route_shape, n // 2 if fused else n), dtype=out_dtype)
++
++    max_m64 = plan.expert_ids.numel()
++    pair_idx, tail_idx, counts = _get_scratch(x.device, max_m64)
++    stream = torch.cuda.current_stream(x.device).cuda_stream
++
++    # Reuse pair/tail scan when w2 runs on the exact same immutable PrefillRoutes plan as w13.
++    if _LAST_PLAN.get(x.device) is not plan or torch.cuda.is_current_stream_capturing():
++        lib.launch_pair_m64(
++            ctypes.c_void_p(plan.expert_ids.data_ptr()),
++            ctypes.c_void_p(plan.padded_tokens.data_ptr()),
++            ctypes.c_void_p(pair_idx.data_ptr()),
++            ctypes.c_void_p(tail_idx.data_ptr()),
++            ctypes.c_void_p(counts.data_ptr()),
++            ctypes.c_int(max_m64),
++            ctypes.c_void_p(stream),
++        )
++        if not torch.cuda.is_current_stream_capturing():
++            _LAST_PLAN[x.device] = plan
++
++    suf = "_xbf16" if use_xbf16 else ""
++    if bank_kind == "source":
++        raw_ptr = bank.raw_scales.data_ptr()
++        outer_ptr = bank.outer_scales.data_ptr()
++        rs_ptr = tab_ptr = kind_ptr = 0
++        fn_name = (f"launch_source_w13_{'f16' if out_fp16 else 'bf16'}{suf}") if fused else "launch_source_w2"
++    elif bank_kind == "mixed":
++        raw_ptr = bank.raw_scales.data_ptr()
++        outer_ptr = bank.outer_scales.data_ptr()
++        kind_ptr = bank.kind.data_ptr()
++        fk = bank.fitted_kind
++        rs_ptr = bank.row_scales.data_ptr() if bank.row_scales is not None else 0
++        tab_ptr = bank.table.data_ptr() if bank.table is not None else 0
++        prefix = f"launch_mixed{fk}"
++        fn_name = (f"{prefix}_w13_{'f16' if out_fp16 else 'bf16'}{suf}") if fused else f"{prefix}_w2"
++    elif bank_kind == "coda":
++        raw_ptr = bank.tags.data_ptr()
++        outer_ptr = 0
++        kind_ptr = 0
++        rs_ptr = bank.row_scales.data_ptr()
++        tab_ptr = bank.table.data_ptr()
++        fn_name = (f"launch_coda_w13_{'f16' if out_fp16 else 'bf16'}{suf}") if fused else "launch_coda_w2"
++    else:
++        return None
++
++    fn = getattr(lib, fn_name)
++    fn(
++        ctypes.c_void_p(x_in.data_ptr()),
++        ctypes.c_void_p(bank.packed.data_ptr()),
++        ctypes.c_void_p(raw_ptr),
++        ctypes.c_void_p(outer_ptr),
++        ctypes.c_void_p(rs_ptr),
++        ctypes.c_void_p(tab_ptr),
++        ctypes.c_void_p(kind_ptr),
++        ctypes.c_void_p(plan.sorted_ids.data_ptr()),
++        ctypes.c_void_p(plan.expert_ids.data_ptr()),
++        ctypes.c_void_p(pair_idx.data_ptr()),
++        ctypes.c_void_p(tail_idx.data_ptr()),
++        ctypes.c_void_p(counts.data_ptr()),
++        ctypes.c_void_p(out.data_ptr()),
++        ctypes.c_void_p(gamma.data_ptr() if gamma is not None else 0),
++        ctypes.c_int(n),
++        ctypes.c_int(k),
++        ctypes.c_int(plan.num_tokens * plan.top_k),
++        ctypes.c_int(max_m64),
++        ctypes.c_float(gate_cap),
++        ctypes.c_float(up_cap),
++        ctypes.c_void_p(stream),
++    )
++    return out
++
++
++def hip_kv_conv_prefill(
++    k: torch.Tensor,
++    v: torch.Tensor,
++    k_weight: torch.Tensor,
++    v_weight: torch.Tensor,
++    k_dynamic: torch.Tensor | None,
++    v_dynamic: torch.Tensor | None,
++    cache: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    kv_slot_mapping: torch.Tensor,
++    positions: torch.Tensor,
++    seq_idx: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    block_table: torch.Tensor,
++    query_start: torch.Tensor,
++    *,
++    num_tokens: int,
++    num_heads: int,
++    head_dim: int,
++    width: int,
++    scale: float,
++    clip_threshold: float,
++    clip_eps: float,
++    norm_eps: float,
++) -> bool:
++    """Run native 1-warp (zero-barrier, zero-LDS, uint2) fused K+V short-conv prefill."""
++    lib = _get_hip_lib()
++    if lib is None or num_tokens < 256 or head_dim != 128 or width != 4:
++        return False
++    dynamic = k_dynamic is not None
++    if (
++        k.dtype != torch.bfloat16
++        or v.dtype != torch.bfloat16
++        or k_weight.dtype != torch.bfloat16
++        or v_weight.dtype != torch.bfloat16
++        or cache.dtype != torch.bfloat16
++        or key_cache.dtype != torch.bfloat16
++        or value_cache.dtype != torch.bfloat16
++        or k.stride(1) != 1
++        or v.stride(1) != 1
++        or cache.stride(3) != 1
++        or key_cache.stride(3) != 1
++        or value_cache.stride(3) != 1
++        or (k.data_ptr() & 7) != 0
++        or (v.data_ptr() & 7) != 0
++        or (cache.data_ptr() & 7) != 0
++        or (key_cache.data_ptr() & 7) != 0
++        or (value_cache.data_ptr() & 7) != 0
++        or (k.stride(0) & 3) != 0
++        or (v.stride(0) & 3) != 0
++        or (cache.stride(0) & 3) != 0
++        or (cache.stride(1) & 3) != 0
++        or (cache.stride(2) & 3) != 0
++        or (key_cache.stride(0) & 3) != 0
++        or (key_cache.stride(1) & 3) != 0
++        or (key_cache.stride(2) & 3) != 0
++    ):
++        return False
++    if dynamic:
++        if (
++            v_dynamic is None
++            or k_dynamic.dtype != torch.bfloat16
++            or v_dynamic.dtype != torch.bfloat16
++            or k_dynamic.stride(1) != 1
++            or v_dynamic.stride(1) != 1
++            or (k_dynamic.data_ptr() & 7) != 0
++            or (v_dynamic.data_ptr() & 7) != 0
++            or (k_dynamic.stride(0) & 3) != 0
++            or (v_dynamic.stride(0) & 3) != 0
++            or k_weight.stride(1) != 1
++            or v_weight.stride(1) != 1
++            or (k_weight.data_ptr() & 7) != 0
++            or (v_weight.data_ptr() & 7) != 0
++            or (k_weight.stride(0) & 3) != 0
++            or (v_weight.stride(0) & 3) != 0
++        ):
++            return False
++        dk_ptr = k_dynamic.data_ptr()
++        dv_ptr = v_dynamic.data_ptr()
++        sdk = k_dynamic.stride(0)
++        sdv = v_dynamic.stride(0)
++    else:
++        dk_ptr = k_weight.data_ptr()
++        dv_ptr = v_weight.data_ptr()
++        sdk = 0
++        sdv = 0
++
++    stream = torch.cuda.current_stream(k.device).cuda_stream
++    lib.launch_hip_kv_conv_1w(
++        ctypes.c_void_p(k.data_ptr()),
++        ctypes.c_void_p(v.data_ptr()),
++        ctypes.c_void_p(k_weight.data_ptr()),
++        ctypes.c_void_p(v_weight.data_ptr()),
++        ctypes.c_void_p(dk_ptr),
++        ctypes.c_void_p(dv_ptr),
++        ctypes.c_void_p(cache.data_ptr()),
++        ctypes.c_void_p(key_cache.data_ptr()),
++        ctypes.c_void_p(value_cache.data_ptr()),
++        ctypes.c_void_p(kv_slot_mapping.data_ptr()),
++        ctypes.c_void_p(positions.data_ptr()),
++        ctypes.c_void_p(seq_idx.data_ptr()),
++        ctypes.c_void_p(slot_mapping.data_ptr()),
++        ctypes.c_void_p(block_table.data_ptr()),
++        ctypes.c_void_p(query_start.data_ptr()),
++        ctypes.c_int(num_tokens),
++        ctypes.c_int(num_heads),
++        ctypes.c_int64(k.stride(0)),
++        ctypes.c_int64(v.stride(0)),
++        ctypes.c_int64(k_weight.stride(0)),
++        ctypes.c_int64(k_weight.stride(1)),
++        ctypes.c_int64(sdk),
++        ctypes.c_int64(sdv),
++        ctypes.c_int64(cache.stride(0)),
++        ctypes.c_int64(cache.stride(1)),
++        ctypes.c_int64(cache.stride(2)),
++        ctypes.c_int64(key_cache.stride(0)),
++        ctypes.c_int64(key_cache.stride(1)),
++        ctypes.c_int64(key_cache.stride(2)),
++        ctypes.c_int(key_cache.shape[1]),
++        ctypes.c_int64(block_table.stride(0)),
++        ctypes.c_int(block_table.shape[1]),
++        ctypes.c_int(cache.shape[2]),
++        ctypes.c_float(scale),
++        ctypes.c_float(clip_threshold),
++        ctypes.c_float(clip_eps),
++        ctypes.c_float(norm_eps),
++        ctypes.c_int(1 if dynamic else 0),
++        ctypes.c_void_p(stream),
++    )
++    return True
++
++
++def hip_attn_res_q4_coeffs(
++    bank0: torch.Tensor,
++    bank1: torch.Tensor,
++    queries: torch.Tensor,
++    eps: float = 1e-6,
++) -> torch.Tensor | None:
++    """Compute [4, T, 2] FP32 linear combination coeffs for normalized 2-entry bank."""
++    lib = _get_hip_lib()
++    if lib is None:
++        return None
++    if (
++        bank0.ndim != 2
++        or bank1.shape != bank0.shape
++        or bank0.shape[0] < 64
++        or bank0.shape[1] != 2304
++        or bank0.dtype != torch.bfloat16
++        or bank1.dtype != torch.bfloat16
++        or queries.shape != (4, 2304)
++        or queries.dtype != torch.float32
++        or bank0.stride(1) != 1
++        or bank1.stride(1) != 1
++        or queries.stride(1) != 1
++        or (bank0.data_ptr() & 15) != 0
++        or (bank1.data_ptr() & 15) != 0
++        or (queries.data_ptr() & 15) != 0
++        or (bank0.stride(0) & 7) != 0
++        or (bank1.stride(0) & 7) != 0
++        or (queries.stride(0) & 3) != 0
++    ):
++        return None
++    t_len = bank0.shape[0]
++    coeffs = queries.new_empty((4, t_len, 2), dtype=torch.float32)
++    stream = torch.cuda.current_stream(bank0.device).cuda_stream
++    lib.launch_q4_coeffs(
++        ctypes.c_void_p(bank0.data_ptr()),
++        ctypes.c_void_p(bank1.data_ptr()),
++        ctypes.c_void_p(queries.data_ptr()),
++        ctypes.c_void_p(coeffs.data_ptr()),
++        ctypes.c_int64(bank0.stride(0)),
++        ctypes.c_int64(bank1.stride(0)),
++        ctypes.c_int64(queries.stride(0)),
++        ctypes.c_int(t_len),
++        ctypes.c_float(eps),
++        ctypes.c_void_p(stream),
++    )
++    return coeffs
 diff --git a/vllm/models/inkling2/amd/ops/linear.py b/vllm/models/inkling2/amd/ops/linear.py
 new file mode 100644
-index 0000000..71c8f1b
+index 00000000..71c8f1b0
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/linear.py
 @@ -0,0 +1,153 @@
@@ -6915,7 +8526,7 @@ index 0000000..71c8f1b
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/loop.py b/vllm/models/inkling2/amd/ops/loop.py
 new file mode 100644
-index 0000000..271c036
+index 00000000..271c036d
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/loop.py
 @@ -0,0 +1,192 @@
@@ -7113,7 +8724,7 @@ index 0000000..271c036
 +    return (_unit_rms(mixed, norm_eps) * norm_weight[:, None]).to(last.dtype)
 diff --git a/vllm/models/inkling2/amd/ops/loop_controller.py b/vllm/models/inkling2/amd/ops/loop_controller.py
 new file mode 100644
-index 0000000..839179e
+index 00000000..839179e3
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/loop_controller.py
 @@ -0,0 +1,87 @@
@@ -7206,7 +8817,7 @@ index 0000000..839179e
 +    return _project_gain_forget(hidden, gain_forget_weight)
 diff --git a/vllm/models/inkling2/amd/ops/loop_m8_fused.py b/vllm/models/inkling2/amd/ops/loop_m8_fused.py
 new file mode 100644
-index 0000000..bf95ad1
+index 00000000..bf95ad14
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/loop_m8_fused.py
 @@ -0,0 +1,106 @@
@@ -7318,7 +8929,7 @@ index 0000000..bf95ad1
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/lossless_bf16.py b/vllm/models/inkling2/amd/ops/lossless_bf16.py
 new file mode 100644
-index 0000000..3d96eb4
+index 00000000..3d96eb44
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/lossless_bf16.py
 @@ -0,0 +1,244 @@
@@ -7568,7 +9179,7 @@ index 0000000..3d96eb4
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/markov_argmax.py b/vllm/models/inkling2/amd/ops/markov_argmax.py
 new file mode 100644
-index 0000000..6b80c07
+index 00000000..6b80c07b
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/markov_argmax.py
 @@ -0,0 +1,117 @@
@@ -7691,7 +9302,7 @@ index 0000000..6b80c07
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/mixed_grouped_decode.py b/vllm/models/inkling2/amd/ops/mixed_grouped_decode.py
 new file mode 100644
-index 0000000..07d51da
+index 00000000..07d51dac
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/mixed_grouped_decode.py
 @@ -0,0 +1,158 @@
@@ -7855,7 +9466,7 @@ index 0000000..07d51da
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/mixed_wmma_pretile.py b/vllm/models/inkling2/amd/ops/mixed_wmma_pretile.py
 new file mode 100644
-index 0000000..21584b6
+index 00000000..21584b63
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/mixed_wmma_pretile.py
 @@ -0,0 +1,203 @@
@@ -8064,7 +9675,7 @@ index 0000000..21584b6
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/norm.py b/vllm/models/inkling2/amd/ops/norm.py
 new file mode 100644
-index 0000000..eb84868
+index 00000000..eb848686
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/norm.py
 @@ -0,0 +1,183 @@
@@ -8253,7 +9864,7 @@ index 0000000..eb84868
 +            )
 diff --git a/vllm/models/inkling2/amd/ops/qkvr_w8.py b/vllm/models/inkling2/amd/ops/qkvr_w8.py
 new file mode 100644
-index 0000000..6fa0db4
+index 00000000..6fa0db4b
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/qkvr_w8.py
 @@ -0,0 +1,87 @@
@@ -8346,7 +9957,7 @@ index 0000000..6fa0db4
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/router.py b/vllm/models/inkling2/amd/ops/router.py
 new file mode 100644
-index 0000000..1a783b1
+index 00000000..1a783b15
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/router.py
 @@ -0,0 +1,143 @@
@@ -8495,7 +10106,7 @@ index 0000000..1a783b1
 +    return gamma
 diff --git a/vllm/models/inkling2/amd/ops/router_m8.py b/vllm/models/inkling2/amd/ops/router_m8.py
 new file mode 100644
-index 0000000..9e644ff
+index 00000000..9e644ff1
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/router_m8.py
 @@ -0,0 +1,110 @@
@@ -8611,7 +10222,7 @@ index 0000000..9e644ff
 +    return ids, gamma, plan
 diff --git a/vllm/models/inkling2/amd/ops/sconv.py b/vllm/models/inkling2/amd/ops/sconv.py
 new file mode 100644
-index 0000000..d153ce0
+index 00000000..d153ce09
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/sconv.py
 @@ -0,0 +1,889 @@
@@ -9506,7 +11117,7 @@ index 0000000..d153ce0
 +    )
 diff --git a/vllm/models/inkling2/amd/ops/source_wave_decode.py b/vllm/models/inkling2/amd/ops/source_wave_decode.py
 new file mode 100644
-index 0000000..4f200f8
+index 00000000..4f200f80
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/source_wave_decode.py
 @@ -0,0 +1,144 @@
@@ -9656,7 +11267,7 @@ index 0000000..4f200f8
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/source_wmma_pretile.py b/vllm/models/inkling2/amd/ops/source_wmma_pretile.py
 new file mode 100644
-index 0000000..3dffae9
+index 00000000..3dffae99
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/source_wmma_pretile.py
 @@ -0,0 +1,189 @@
@@ -9851,12 +11462,11 @@ index 0000000..3dffae9
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/turbo_kernels.py b/vllm/models/inkling2/amd/ops/turbo_kernels.py
 new file mode 100644
-index 0000000..23a6f27
+index 00000000..3de94a00
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/turbo_kernels.py
-@@ -0,0 +1,2054 @@
+@@ -0,0 +1,2629 @@
 +# SPDX-License-Identifier: Apache-2.0
-+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 +"""Ciru gfx1151 turbo kernels for Inkling 2 Mini PP & TG on vLLM."""
 +
 +from typing import NamedTuple
@@ -9874,6 +11484,8 @@ index 0000000..23a6f27
 +
 +from vllm.v1.worker.gpu.sample.greedy_argmax import _argmax_finish
 +from .coda_wmma_pretile import _c1_bf16_pair, _expand_c1_groups
++from .norm import _l2_clip
++from .sconv import _conv
 +from .source_wmma_pretile import _finite_bf16, _unpack_e2m1
 +
 +# ============================================================================
@@ -9906,8 +11518,12 @@ index 0000000..23a6f27
 +    TOKENS: gl.constexpr, FUSED: gl.constexpr, GATE: gl.constexpr, UP: gl.constexpr,
 +    M_TILE: gl.constexpr, USE_F16: gl.constexpr,
 +):
-+    m = gl.program_id(0)
-+    n = gl.program_id(1)
++    if M_TILE == 64:
++        n = gl.program_id(0)
++        m = gl.program_id(1)
++    else:
++        m = gl.program_id(0)
++        n = gl.program_id(1)
 +    if m * M_TILE >= gl.load(Padded):
 +        return
 +    expert = gl.load(Expert + m)
@@ -9998,7 +11614,8 @@ index 0000000..23a6f27
 +    out = x.new_empty((*route_shape, n // 2 if gamma is not None else n))
 +    bm = plan.block_m
 +    ns = 2 if bm == 64 else 1
-+    _source_wmma_turbo_kernel[(plan.expert_ids.numel(), n_tiles)](
++    grid = (n_tiles, plan.expert_ids.numel()) if bm == 64 else (plan.expert_ids.numel(), n_tiles)
++    _source_wmma_turbo_kernel[grid](
 +        x, bank.packed, bank.raw_scales, bank.outer_scales,
 +        plan.sorted_ids, plan.expert_ids, plan.padded_tokens, out, gamma,
 +        N=n, K=k, ROUTES=plan.num_tokens * plan.top_k,
@@ -10091,79 +11708,62 @@ index 0000000..23a6f27
 +
 +
 +@gluon.jit
-+def _mixed_wmma_tile_m64(
-+    X, Packed, Raw, Outer, RowScale, Table, expert, rows, valid, n,
-+    N: gl.constexpr, K: gl.constexpr, KIND: gl.constexpr,
-+    MMA: gl.constexpr, A_LOAD: gl.constexpr,
-+):
-+    b_byte: gl.constexpr = gl.DistributedLinearLayout(
-+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
-+        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
-+        [[16, 0], [32, 0]], [], [128, 32],
-+    )
-+    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
-+    a_cols = gl.arange(0, 64, gl.SliceLayout(0, A_LOAD))
-+    byte_cols = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
-+    tile = (expert.to(gl.int64) * (N // 128) + n) * (K // 64)
-+    if KIND == 0:
-+        outer = gl.load(Outer + expert)
-+    elif KIND == 2:
-+        row = gl.load(RowScale + expert.to(gl.int64) * N + n * 128 + b_row).to(gl.float32)
-+    acc = gl.zeros((64, 128), gl.float32, MMA)
-+    for k in range(K // 64):
-+        x = gl.load(X + rows[:, None] * K + k * 64 + a_cols[None, :], valid[:, None], 0)
-+        packet_row = (tile + k) * 128 + b_row
-+        packed = gl.load(Packed + packet_row[:, None] * 32 + byte_cols[None, :]).to(gl.uint32)
-+        raw = gl.load(Raw + packet_row).to(gl.uint32)
-+        if KIND == 0:
-+            scale_byte = (raw[:, None] >> ((byte_cols[None, :] // 8) * 8)) & 255
-+            scale_bits = ((scale_byte << 4) + (119 << 7)).to(gl.uint16)
-+            scale = scale_bits.to(gl.bfloat16, bitcast=True).to(gl.float32)
-+            low, high = _unpack_e2m1(packed)
-+            low = _finite_bf16((low * scale) * outer)
-+            high = _finite_bf16((high * scale) * outer)
-+        elif KIND == 1:
-+            scale_bits = (raw[:, None] >> ((byte_cols[None, :] // 16) * 16)).to(gl.uint16)
-+            scale = scale_bits.to(gl.bfloat16, bitcast=True).to(gl.float32)
-+            low = ((((packed & 15).to(gl.int32) ^ 8) - 8).to(gl.float32) * scale).to(gl.bfloat16, fp_downcast_rounding="rtne")
-+            high = ((((packed >> 4).to(gl.int32) ^ 8) - 8).to(gl.float32) * scale).to(gl.bfloat16, fp_downcast_rounding="rtne")
-+        else:
-+            low, high = _c1_bf16_pair(packed, raw, row, Table, expert)
-+        weights = gl.reshape(gl.join(low, high), (128, 64))
-+        a = gl.convert_layout(x, gl.DotOperandLayout(0, MMA, 16))
-+        b = gl.convert_layout(gl.permute(weights, (1, 0)), gl.DotOperandLayout(1, MMA, 16))
-+        acc = wmma(a, b, acc)
-+    return acc
-+
-+
-+@gluon.jit
-+def _mixed_wmma_prefill_m64(
++def _mixed_split_kind_m64_kernel(
 +    X, Packed, Raw, Outer, Kind, RowScale, Table, Sorted, Expert, Padded, Y, Gamma,
 +    N: gl.constexpr, K: gl.constexpr, ROUTES, TOKENS: gl.constexpr,
-+    FITTED_KIND: gl.constexpr, FUSED: gl.constexpr, GATE: gl.constexpr, UP: gl.constexpr,
++    TARGET_KIND: gl.constexpr, FUSED: gl.constexpr, GATE: gl.constexpr, UP: gl.constexpr,
 +):
-+    m = gl.program_id(0)
-+    n = gl.program_id(1)
++    n = gl.program_id(0)
++    m = gl.program_id(1)
 +    if m * 64 >= gl.load(Padded):
 +        return
 +    expert = gl.load(Expert + m)
 +    if expert < 0:
 +        return
++    if gl.load(Kind + expert) != TARGET_KIND:
++        return
 +    mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
 +    a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
++    out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
++    b_byte: gl.constexpr = gl.DistributedLinearLayout(
++        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
++        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
++        [[16, 0], [32, 0]], [], [128, 32],
++    )
 +    a_range = gl.arange(0, 64, gl.SliceLayout(1, a_load))
++    a_cols = gl.arange(0, 64, gl.SliceLayout(0, a_load))
++    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
++    byte_cols = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
 +    route = gl.load(Sorted + m * 64 + a_range).to(gl.int64)
 +    valid = (route >= 0) & (route < ROUTES)
 +    rows = route // TOKENS
-+    if gl.load(Kind + expert) == 0:
-+        acc = _mixed_wmma_tile_m64(
-+            X, Packed, Raw, Outer, RowScale, Table, expert, rows, valid, n, N, K, 0, mma, a_load,
-+        )
-+    else:
-+        acc = _mixed_wmma_tile_m64(
-+            X, Packed, Raw, Outer, RowScale, Table, expert, rows, valid, n, N, K, FITTED_KIND, mma, a_load,
-+        )
-+    out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
++    tile = (expert.to(gl.int64) * (N // 128) + n) * (K // 64)
++    if TARGET_KIND == 0:
++        outer = gl.load(Outer + expert)
++    elif TARGET_KIND == 2:
++        row_sc = gl.load(RowScale + expert.to(gl.int64) * N + n * 128 + b_row).to(gl.float32)
++    acc = gl.zeros((64, 128), gl.float32, mma)
++    for k in range(K // 64):
++        x = gl.load(X + rows[:, None] * K + k * 64 + a_cols[None, :], valid[:, None], 0).to(gl.float16)
++        packet_row = (tile + k) * 128 + b_row
++        packed = gl.load(Packed + packet_row[:, None] * 32 + byte_cols[None, :]).to(gl.uint32)
++        raw = gl.load(Raw + packet_row).to(gl.uint32)
++        if TARGET_KIND == 0:
++            scale_byte = (raw[:, None] >> ((byte_cols[None, :] // 8) * 8)) & 255
++            low, high = _unpack_e2m1_f16x2_scaled(packed, scale_byte)
++        elif TARGET_KIND == 1:
++            scale_bits = (raw[:, None] >> ((byte_cols[None, :] // 16) * 16)).to(gl.uint16)
++            scale = scale_bits.to(gl.bfloat16, bitcast=True).to(gl.float32)
++            low = ((((packed & 15).to(gl.int32) ^ 8) - 8).to(gl.float32) * scale).to(gl.float16)
++            high = ((((packed >> 4).to(gl.int32) ^ 8) - 8).to(gl.float32) * scale).to(gl.float16)
++        else:
++            low, high = _c1_f16_pair(packed, raw, row_sc, Table, expert)
++        weights = gl.reshape(gl.join(low, high), (128, 64))
++        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
++        b = gl.convert_layout(gl.permute(weights, (1, 0)), gl.DotOperandLayout(1, mma, 16))
++        acc = wmma(a, b, acc)
++    if TARGET_KIND == 0:
++        acc = acc * outer
 +    out_rows: gl.constexpr = gl.SliceLayout(1, out_layout)
 +    route = gl.convert_layout(route, out_rows)
 +    valid = gl.convert_layout(valid, out_rows)
@@ -10194,13 +11794,23 @@ index 0000000..23a6f27
 +    if fused_activation is not None:
 +        gamma, gate_cap, up_cap = fused_activation
 +    out = x.new_empty((*route_shape, n // 2 if gamma is not None else n))
-+    _mixed_wmma_prefill_m64[(plan.expert_ids.numel(), n_tiles)](
++    grid = (n_tiles, plan.expert_ids.numel())
++    routes = plan.num_tokens * plan.top_k
++    tokens = plan.top_k if x.ndim == 2 else 1
++    _mixed_split_kind_m64_kernel[grid](
 +        x, bank.packed, bank.raw_scales, bank.outer_scales, bank.kind,
 +        bank.row_scales, bank.table,
 +        plan.sorted_ids, plan.expert_ids, plan.padded_tokens, out, gamma,
-+        N=n, K=k, ROUTES=plan.num_tokens * plan.top_k,
-+        TOKENS=plan.top_k if x.ndim == 2 else 1, FITTED_KIND=bank.fitted_kind,
-+        FUSED=gamma is not None, GATE=gate_cap, UP=up_cap,
++        N=n, K=k, ROUTES=routes, TOKENS=tokens,
++        TARGET_KIND=0, FUSED=gamma is not None, GATE=gate_cap, UP=up_cap,
++        num_warps=4, num_stages=2, enable_fp_fusion=False,
++    )
++    _mixed_split_kind_m64_kernel[grid](
++        x, bank.packed, bank.raw_scales, bank.outer_scales, bank.kind,
++        bank.row_scales, bank.table,
++        plan.sorted_ids, plan.expert_ids, plan.padded_tokens, out, gamma,
++        N=n, K=k, ROUTES=routes, TOKENS=tokens,
++        TARGET_KIND=bank.fitted_kind, FUSED=gamma is not None, GATE=gate_cap, UP=up_cap,
 +        num_warps=4, num_stages=2, enable_fp_fusion=False,
 +    )
 +    return out
@@ -10230,8 +11840,8 @@ index 0000000..23a6f27
 +    E_PAD: tl.constexpr, EXTENT: tl.constexpr, WINDOW: tl.constexpr,
 +    BLOCK_Q: tl.constexpr, BLOCK_N: tl.constexpr,
 +):
-+    q_block = tl.program_id(0)
-+    head = tl.program_id(1)
++    head = tl.program_id(0)
++    q_block = tl.program_id(1)
 +    req = tl.program_id(2)
 +    kv_head = head // GROUP
 +
@@ -10246,20 +11856,20 @@ index 0000000..23a6f27
 +    q_offs = tl.arange(0, BLOCK_Q)
 +    q_idx = q0 + q_offs
 +    row_valid = q_idx < q_len
-+    token = (q_start + q_idx).to(tl.int64)
 +    d = tl.arange(0, D)
 +
-+    q = tl.load(
-+        Q + token[:, None] * stride_qt + head * stride_qh + d[None, :],
-+        row_valid[:, None], other=0.0,
-+    )
++    tok0 = (q_start + q0).to(tl.int64)
++    q_base = Q + tok0 * stride_qt + head.to(tl.int64) * stride_qh
++    q = tl.load(q_base + q_offs[:, None] * stride_qt + d[None, :], row_valid[:, None], other=0.0)
++    q_scaled = (q.to(tl.float32) * scale_log2).to(tl.bfloat16)
++
 +    pos = past + q_idx
 +    first_pos = past + q0
 +    hi = tl.minimum(past + q0 + BLOCK_Q, seq_len)
 +
 +    table = BlockTable + req * stride_table
-+    k_head_base = K + kv_head * stride_kh
-+    v_head_base = V + kv_head * stride_vh
++    k_head_base = K + kv_head.to(tl.int64) * stride_kh
++    v_head_base = V + kv_head.to(tl.int64) * stride_vh
 +    n_offs = tl.arange(0, BLOCK_N)
 +
 +    m_i = tl.full([BLOCK_Q], float("-inf"), tl.float32)
@@ -10269,7 +11879,6 @@ index 0000000..23a6f27
 +    end_block = tl.cdiv(hi, BLOCK_N)
 +
 +    if WINDOW < 0:
-+        q_scaled = (q.to(tl.float32) * scale_log2).to(tl.bfloat16)
 +        first_bias_key = first_pos - E_PAD
 +        near_start_block = tl.maximum(first_bias_key, 0) // BLOCK_N
 +        for blk in range(0, near_start_block):
@@ -10299,9 +11908,10 @@ index 0000000..23a6f27
 +        lo = tl.maximum(first_pos - WINDOW, 0) // BLOCK_N * BLOCK_N
 +        near_start_block = lo // BLOCK_N
 +
-+    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
-+    key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
-+    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
++    # BLOCK_Q divides 128, so all rows in this tile share one scalar key0 and bias base pointer.
++    tile_end_s = tl.minimum((q0 // 128 + 1) * 128, q_len)
++    key0_s = tl.cdiv(past + tile_end_s, 128) * 128 - E_PAD
++    bias_base = Bias + tok0 * stride_bt + head.to(tl.int64) * stride_bh
 +
 +    for blk in range(near_start_block, end_block):
 +        key_begin = blk * BLOCK_N
@@ -10323,13 +11933,14 @@ index 0000000..23a6f27
 +                k_head_base + pg[:, None] * stride_kb + sl[:, None] * stride_kp + d[None, :],
 +                key_valid[:, None], other=0.0,
 +            )
-+        s = tl.dot(q, tl.trans(k)) * scale_log2
++        s = tl.dot(q_scaled, tl.trans(k))
 +        dist = pos[:, None] - keys[None, :]
 +        valid = row_valid[:, None] & key_valid[None, :] & (dist >= 0)
 +        if WINDOW >= 0:
 +            valid &= dist <= WINDOW
-+        in_table = valid & (keys[None, :] >= key0[:, None])
-+        bias = tl.load(bias_rows[:, None] + keys[None, :], in_table, other=0.0)
++        b_col = keys - key0_s
++        in_table = valid & (b_col[None, :] >= 0)
++        bias = tl.load(bias_base + q_offs[:, None] * stride_bt + b_col[None, :], in_table, other=0.0)
 +        s = s + bias.to(tl.float32) * 1.4426950408889634
 +        s = tl.where(valid, s, float("-inf"))
 +        m_new = tl.maximum(m_i, tl.max(s, 1))
@@ -10353,11 +11964,11 @@ index 0000000..23a6f27
 +    has_keys = l_i > 0.0
 +    out = acc / tl.where(has_keys, l_i, 1.0)[:, None]
 +    lse_e = tl.where(has_keys, (m_i + tl.math.log2(l_i)) * 0.6931471805599453, float("-inf"))
-+    gate = tl.load(Gate + token[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
-+    sink = tl.load(Sink + token * stride_sink + head, row_valid, other=0.0).to(tl.float32)
++    gate = tl.load(Gate + tok0 * stride_gate + q_offs[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
++    sink = tl.load(Sink + tok0 * stride_sink + q_offs * stride_sink + head, row_valid, other=0.0).to(tl.float32)
 +    y = out * _turbo_sigmoid(gate) * _turbo_sigmoid(lse_e - sink)[:, None]
 +    tl.store(
-+        Result + token[:, None] * stride_res + head * D + d[None, :],
++        Result + tok0 * stride_res + q_offs[:, None] * stride_res + head * D + d[None, :],
 +        y.to(Result.dtype.element_ty),
 +        row_valid[:, None],
 +    )
@@ -10404,8 +12015,8 @@ index 0000000..23a6f27
 +    E_PAD: tl.constexpr,
 +    BLOCK_Q: tl.constexpr, BLOCK_N: tl.constexpr,
 +):
-+    q_block = tl.program_id(0)
-+    head = tl.program_id(1)
++    head = tl.program_id(0)
++    q_block = tl.program_id(1)
 +    kv_head = head // GROUP
 +
 +    q_start = tl.load(CuSeqlensQ + req_idx)
@@ -10419,19 +12030,18 @@ index 0000000..23a6f27
 +    q_offs = tl.arange(0, BLOCK_Q)
 +    q_idx = q0 + q_offs
 +    row_valid = q_idx < q_len
-+    token = (q_start + q_idx).to(tl.int64)
 +    d = tl.arange(0, D)
 +
-+    q = tl.load(
-+        Q + token[:, None] * stride_qt + head * stride_qh + d[None, :],
-+        row_valid[:, None], other=0.0,
-+    )
++    tok0 = (q_start + q0).to(tl.int64)
++    q_base = Q + tok0 * stride_qt + head.to(tl.int64) * stride_qh
++    q = tl.load(q_base + q_offs[:, None] * stride_qt + d[None, :], row_valid[:, None], other=0.0)
++    q_scaled = (q.to(tl.float32) * scale_log2).to(tl.bfloat16)
 +    pos = past + q_idx
 +    hi = tl.minimum(past + q0 + BLOCK_Q, seq_len)
 +
 +    table = BlockTable + req_idx * stride_table
-+    k_head_base = K + kv_head * stride_kh
-+    v_head_base = V + kv_head * stride_vh
++    k_head_base = K + kv_head.to(tl.int64) * stride_kh
++    v_head_base = V + kv_head.to(tl.int64) * stride_vh
 +    n_offs = tl.arange(0, BLOCK_N)
 +
 +    lse_far = tl.load(
@@ -10449,9 +12059,9 @@ index 0000000..23a6f27
 +    near_start_block = far_len // BLOCK_N
 +    end_block = tl.cdiv(hi, BLOCK_N)
 +
-+    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
-+    key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
-+    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
++    tile_end_s = tl.minimum((q0 // 128 + 1) * 128, q_len)
++    key0_s = tl.cdiv(past + tile_end_s, 128) * 128 - E_PAD
++    bias_base = Bias + tok0 * stride_bt + head.to(tl.int64) * stride_bh
 +
 +    for blk in range(near_start_block, end_block):
 +        key_begin = blk * BLOCK_N
@@ -10473,11 +12083,12 @@ index 0000000..23a6f27
 +                k_head_base + pg[:, None] * stride_kb + sl[:, None] * stride_kp + d[None, :],
 +                key_valid[:, None], other=0.0,
 +            )
-+        s = tl.dot(q, tl.trans(k)) * scale_log2
++        s = tl.dot(q_scaled, tl.trans(k))
 +        dist = pos[:, None] - keys[None, :]
 +        valid = row_valid[:, None] & key_valid[None, :] & (dist >= 0)
-+        in_table = valid & (keys[None, :] >= key0[:, None])
-+        bias = tl.load(bias_rows[:, None] + keys[None, :], in_table, other=0.0)
++        b_col = keys - key0_s
++        in_table = valid & (b_col[None, :] >= 0)
++        bias = tl.load(bias_base + q_offs[:, None] * stride_bt + b_col[None, :], in_table, other=0.0)
 +        s = s + bias.to(tl.float32) * 1.4426950408889634
 +        s = tl.where(valid, s, float("-inf"))
 +        m_new = tl.maximum(m_i, tl.max(s, 1))
@@ -10501,11 +12112,11 @@ index 0000000..23a6f27
 +    has_keys = l_i > 0.0
 +    out = acc / tl.where(has_keys, l_i, 1.0)[:, None]
 +    lse_e = tl.where(has_keys, (m_i + tl.math.log2(l_i)) * 0.6931471805599453, float("-inf"))
-+    gate = tl.load(Gate + token[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
-+    sink = tl.load(Sink + token * stride_sink + head, row_valid, other=0.0).to(tl.float32)
++    gate = tl.load(Gate + tok0 * stride_gate + q_offs[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
++    sink = tl.load(Sink + tok0 * stride_sink + q_offs * stride_sink + head, row_valid, other=0.0).to(tl.float32)
 +    y = out * _turbo_sigmoid(gate) * _turbo_sigmoid(lse_e - sink)[:, None]
 +    tl.store(
-+        Result + token[:, None] * stride_res + head * D + d[None, :],
++        Result + tok0 * stride_res + q_offs[:, None] * stride_res + head * D + d[None, :],
 +        y.to(Result.dtype.element_ty),
 +        row_valid[:, None],
 +    )
@@ -10528,7 +12139,8 @@ index 0000000..23a6f27
 +    num_reqs = cache_seqlens.shape[0]
 +    e_pad = sheared_bias.shape[2]
 +    extent = e_pad - 256
-+    bq, bn, nw = 64, 32, 4
++    # BLOCK_N=16 stays <= PAGE (16/32/64) for scalar page_id + contiguous loads and higher occupancy (1.44-1.70x faster on gfx1151).
++    bq, bn, nw = 64, (16 if page >= 16 else 32), 4
 +    # Hybrid AOTriton-Far + Triton-Near for long-context global prefill (>=16K past):
 +    # eliminates the 32K->64K MALL spill cliff (2.40x faster at 64K, 0.0000 BF16 max err).
 +    if (
@@ -10555,7 +12167,7 @@ index 0000000..23a6f27
 +            for r, qs, ql in short_reqs:
 +                qe = qs + ql
 +                cu1 = cu_seqlens_q.new_tensor([0, ql])
-+                _turbo_prefill_rel_attn_kernel[(triton.cdiv(ql, bq), num_heads, 1)](
++                _turbo_prefill_rel_attn_kernel[(num_heads, triton.cdiv(ql, bq), 1)](
 +                    q[qs:qe], key_cache, value_cache, sheared_bias[qs:qe],
 +                    gate[qs:qe], sinks[qs:qe], result[qs:qe],
 +                    block_table[r : r + 1], cache_seqlens[r : r + 1], cu1,
@@ -10587,7 +12199,7 @@ index 0000000..23a6f27
 +                )[:2]
 +                out_far_3d = out_far[0]
 +                lse_far_2d = lse_far[0]
-+                _turbo_prefill_rel_attn_near_merge_kernel[(triton.cdiv(ql, bq), num_heads)](
++                _turbo_prefill_rel_attn_near_merge_kernel[(num_heads, triton.cdiv(ql, bq))](
 +                    q, key_cache, value_cache, sheared_bias, gate, sinks,
 +                    out_far_3d, lse_far_2d, result,
 +                    block_table, cache_seqlens, cu_seqlens_q,
@@ -10604,7 +12216,7 @@ index 0000000..23a6f27
 +                    E_PAD=e_pad, BLOCK_Q=bq, BLOCK_N=bn, num_warps=nw, num_stages=1,
 +                )
 +            return
-+    grid = (triton.cdiv(max_seqlen_q, bq), num_heads, num_reqs)
++    grid = (num_heads, triton.cdiv(max_seqlen_q, bq), num_reqs)
 +    _turbo_prefill_rel_attn_kernel[grid](
 +        q, key_cache, value_cache, sheared_bias, gate, sinks, result,
 +        block_table, cache_seqlens, cu_seqlens_q,
@@ -10931,6 +12543,58 @@ index 0000000..23a6f27
 +    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
 +
 +
++@gluon.jit
++def _w6_wmma_splitk_batched_kernel(
++    X, P4, P2, Scales, Partial, M,
++    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr, SPLITS: gl.constexpr,
++):
++    tile_n = gl.program_id(0)
++    tile_m = gl.program_id(1)
++    sp = gl.program_id(2)
++    k_tiles: gl.constexpr = K // 64
++    k_per_sp: gl.constexpr = k_tiles // SPLITS
++    k_start = sp * k_per_sp
++    mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
++    a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
++    out_layout: gl.constexpr = gl.DistributedLinearLayout(
++        [[0, 1], [0, 4], [0, 8], [0, 64]],
++        [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
++        [[0, 16], [0, 32]], [], [16, 128],
++    )
++    b_byte: gl.constexpr = gl.DistributedLinearLayout(
++        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
++        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
++        [[16, 0], [32, 0]], [], [128, 32],
++    )
++    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
++    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
++    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
++    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
++    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
++    for dk in range(k_per_sp):
++        kt = k_start + dk
++        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
++        tidx = (tile_n * k_tiles + kt) * 128 + b_row
++        p4 = gl.load(P4 + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
++        p2_word = gl.load(P2 + tidx[:, None] * 4 + (b_col[None, :] // 8))
++        shift = (b_col[None, :] & 7) * 4
++        h2_pair = (p2_word >> shift) & 15
++        sc = gl.load(Scales + tidx)
++        lo_q = (((p4 & 15) | ((h2_pair & 3) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
++        hi_q = (((p4 >> 4) | ((h2_pair >> 2) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
++        w = gl.reshape(gl.join(lo_q, hi_q), (128, 64))
++        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
++        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
++        acc = wmma(a, b, acc)
++    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
++    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
++    val = gl.convert_layout(acc, out_layout)
++    gl.store(
++        Partial + (sp * M + out_row[:, None]) * N + tile_n * 128 + out_col[None, :],
++        val, out_row[:, None] < M,
++    )
++
++
 +def w6_wmma_linear(
 +    x: torch.Tensor, weight: W6WmmaWeight, *,
 +    out_dtype: torch.dtype = torch.bfloat16, soft_cap: float = 0.0, splits: int = 1,
@@ -10938,7 +12602,22 @@ index 0000000..23a6f27
 +    m, k = x.shape
 +    n_pad = weight.padded_out
 +    out = x.new_empty((m, n_pad), dtype=out_dtype)
-+    if m > 16:
++    if (
++        m > 16
++        and splits > 1
++        and out_dtype == torch.bfloat16
++        and soft_cap == 0.0
++        and (k // 64) % splits == 0
++    ):
++        partial = torch.empty((splits, m, n_pad), dtype=torch.float32, device=x.device)
++        _w6_wmma_splitk_batched_kernel[(n_pad // 128, triton.cdiv(m, 16), splits)](
++            x.contiguous(), weight.p4, weight.p2, weight.scales, partial, m,
++            N=n_pad, K=k, M_TILE=16, SPLITS=splits, num_warps=4, num_stages=2,
++        )
++        _reduce_splits_bf16[(triton.cdiv(m * n_pad, 256),)](
++            partial, out, m * n_pad, splits, 256, num_warps=4,
++        )
++    elif m > 16:
 +        bm = 32 if m <= 32 else 64
 +        _w6_wmma_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
 +            x.contiguous(), weight.p4, weight.p2, weight.scales, out, m,
@@ -10972,12 +12651,12 @@ index 0000000..23a6f27
 +    n_pad = weight.padded_out
 +    out = x_q.new_empty((m, n_pad), dtype=torch.bfloat16)
 +    if m > 16:
-+        bm = 32 if m <= 32 else 64
++        bm = 32
 +        _w6_wmma_qkv_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
 +            x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
 +            weight.p4, weight.p2, weight.scales, out, m,
 +            Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
-+            N=n_pad, K=k, M_TILE=bm, num_warps=4, num_stages=1,
++            N=n_pad, K=k, M_TILE=bm, num_warps=4, num_stages=2,
 +        )
 +    else:
 +        _w6_wmma_qkv_m8_kernel[(n_pad // 128,)](
@@ -11130,13 +12809,71 @@ index 0000000..23a6f27
 +    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
 +
 +
++@gluon.jit
++def _w4_wmma_splitk_kernel(
++    X, Packed, Scales, Partial, M,
++    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr, SPLITS: gl.constexpr,
++):
++    tile_n = gl.program_id(0)
++    tile_m = gl.program_id(1)
++    sp = gl.program_id(2)
++    k_tiles: gl.constexpr = K // 64
++    k_per_sp: gl.constexpr = k_tiles // SPLITS
++    k_start = sp * k_per_sp
++    mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
++    a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
++    out_layout: gl.constexpr = gl.DistributedLinearLayout(
++        [[0, 1], [0, 4], [0, 8], [0, 64]],
++        [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
++        [[0, 16], [0, 32]], [], [16, 128],
++    )
++    b_byte: gl.constexpr = gl.DistributedLinearLayout(
++        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
++        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
++        [[16, 0], [32, 0]], [], [128, 32],
++    )
++    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
++    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
++    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
++    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
++    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
++    for dk in range(k_per_sp):
++        kt = k_start + dk
++        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
++        tidx = (tile_n * k_tiles + kt) * 128 + b_row
++        packed = gl.load(Packed + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
++        sc = gl.load(Scales + tidx)
++        lo = ((packed & 15).to(gl.int32) - 8).to(gl.float16) * sc[:, None]
++        hi = ((packed >> 4).to(gl.int32) - 8).to(gl.float16) * sc[:, None]
++        w = gl.reshape(gl.join(lo, hi), (128, 64))
++        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
++        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
++        acc = wmma(a, b, acc)
++    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
++    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
++    val = gl.convert_layout(acc, out_layout)
++    gl.store(
++        Partial + (sp * M + out_row[:, None]) * N + tile_n * 128 + out_col[None, :],
++        val, out_row[:, None] < M,
++    )
++
++
 +def w4_wmma_linear(
 +    x: torch.Tensor, weight: W4WmmaWeight, *, bias: torch.Tensor | None = None, splits: int = 1,
 +) -> torch.Tensor:
 +    m, k = x.shape
 +    n_pad = weight.padded_out
 +    out = x.new_empty((m, n_pad), dtype=torch.bfloat16)
-+    if m > 16 or bias is not None:
++    if m > 16 and bias is None and splits > 1 and (k // 64) % splits == 0:
++        partial = torch.empty((splits, m, n_pad), dtype=torch.float32, device=x.device)
++        _w4_wmma_splitk_kernel[(n_pad // 128, triton.cdiv(m, 16), splits)](
++            x.contiguous(), weight.packed, weight.scales, partial, m,
++            N=n_pad, K=k, M_TILE=16, SPLITS=splits, num_warps=4, num_stages=2,
++        )
++        _reduce_splits_bf16[(triton.cdiv(m * n_pad, 256),)](
++            partial, out, m * n_pad, splits, 256, num_warps=4,
++        )
++    elif m > 16 or bias is not None:
 +        bm = 16 if m <= 16 else (32 if m <= 32 else 64)
 +        bias_arg = bias if bias is not None else out
 +        _w4_wmma_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
@@ -11277,7 +13014,7 @@ index 0000000..23a6f27
 +
 +
 +# ============================================================================
-+# 6. TURBO M=8 SPLIT-KV DECODE ATTENTION (1.80x FASTER AT 64K!)
++# 6. TURBO M=8 SPLIT-KV DECODE ATTENTION
 +# ============================================================================
 +
 +@triton.jit
@@ -11367,7 +13104,7 @@ index 0000000..23a6f27
 +
 +    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
 +    key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
-+    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
++    bias_rows = Bias + token * stride_bt + head.to(tl.int64) * stride_bh - key0
 +
 +    for blk in range(near_start, n_end):
 +        key_begin = blk * BLOCK_N
@@ -11467,7 +13204,7 @@ index 0000000..23a6f27
 +
 +
 +# ============================================================================
-+# 7. FAST M=8 ROUTER (1.62x FASTER) & FAST LOOP CONTROLLER DOWN (1.61x)
++# 7. FAST M=8 ROUTER & LOOP CONTROLLER DOWN
 +# ============================================================================
 +
 +@triton.jit
@@ -11585,10 +13322,10 @@ index 0000000..23a6f27
 +    row = gl.convert_layout(row_scale, group_rows, assert_trivial=True)
 +    tag = (raw[:, None] >> (group[None, :] * 8)) & 255
 +    entries = gl.load(Table.to(gl.pointer_type(gl.uint32)) + expert * 256 + tag)
-+    scale = entries.to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32)
-+    offset = (entries >> 16).to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32)
-+    scale = _expand_c1_groups(scale * row[:, None], packed.type.layout)
-+    offset = _expand_c1_groups(offset * row[:, None], packed.type.layout)
++    scale = entries.to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32) * row[:, None]
++    offset = (entries >> 16).to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32) * row[:, None]
++    scale = _expand_c1_groups(scale, packed.type.layout)
++    offset = _expand_c1_groups(offset, packed.type.layout)
 +    low = ((packed & 15).to(gl.float32) * scale + offset).to(gl.float16)
 +    high = ((packed >> 4).to(gl.float32) * scale + offset).to(gl.float16)
 +    return low, high
@@ -11707,6 +13444,7 @@ index 0000000..23a6f27
 +        gamma, gate_cap, up_cap = fused_activation
 +    out = x.new_empty((*route_shape, n // 2 if gamma is not None else n))
 +    bm = plan.block_m
++    ns = 2 if bm == 64 else 1
 +    _mixed_wmma_turbo_kernel[(plan.expert_ids.numel(), n_tiles)](
 +        x, bank.packed, bank.raw_scales, bank.outer_scales, bank.kind,
 +        bank.row_scales, bank.table,
@@ -11714,7 +13452,7 @@ index 0000000..23a6f27
 +        N=n, K=k, ROUTES=plan.num_tokens * plan.top_k,
 +        TOKENS=plan.top_k if x.ndim == 2 else 1, FITTED_KIND=bank.fitted_kind,
 +        FUSED=gamma is not None, GATE=gate_cap, UP=up_cap, M_TILE=bm,
-+        num_warps=4, num_stages=2 if bm == 64 else 1, enable_fp_fusion=False,
++        num_warps=4, num_stages=ns, enable_fp_fusion=False,
 +    )
 +    return out
 +
@@ -11726,8 +13464,12 @@ index 0000000..23a6f27
 +    FUSED: gl.constexpr, GATE: gl.constexpr, UP: gl.constexpr,
 +    M_TILE: gl.constexpr,
 +):
-+    m = gl.program_id(0)
-+    n = gl.program_id(1)
++    if M_TILE == 64:
++        n = gl.program_id(0)
++        m = gl.program_id(1)
++    else:
++        m = gl.program_id(0)
++        n = gl.program_id(1)
 +    if m * M_TILE >= gl.load(Padded):
 +        return
 +    expert = gl.load(Expert + m)
@@ -11801,19 +13543,21 @@ index 0000000..23a6f27
 +        gamma, gate_cap, up_cap = fused_activation
 +    out = x.new_empty((*route_shape, n // 2 if gamma is not None else n))
 +    bm = plan.block_m
-+    _coda_wmma_turbo_kernel[(plan.expert_ids.numel(), n_tiles)](
++    ns = 2 if bm == 64 else 1
++    grid = (n_tiles, plan.expert_ids.numel()) if bm == 64 else (plan.expert_ids.numel(), n_tiles)
++    _coda_wmma_turbo_kernel[grid](
 +        x, bank.packed, bank.tags, bank.row_scales, bank.table,
 +        plan.sorted_ids, plan.expert_ids, plan.padded_tokens, out, gamma,
 +        N=n, K=k, ROUTES=plan.num_tokens * plan.top_k,
 +        TOKENS=plan.top_k if x.ndim == 2 else 1,
 +        FUSED=gamma is not None, GATE=gate_cap, UP=up_cap, M_TILE=bm,
-+        num_warps=4, num_stages=2 if bm == 64 else 1, enable_fp_fusion=False,
++        num_warps=4, num_stages=ns, enable_fp_fusion=False,
 +    )
 +    return out
 +
 +
 +# ============================================================================
-+# 9. FUSED PREFILL LOOP BLEND + RMSNORM (1.60x FASTER, SKIPS 212MB BMM!)
++# 9. FUSED LOOP BLEND + RMSNORM (BATCHED DECODE M=16..64 & PREFILL)
 +# ============================================================================
 +
 +@triton.jit
@@ -11851,7 +13595,8 @@ index 0000000..23a6f27
 +@triton.jit
 +def _fused_loop_blend_p2_kernel(
 +    Blended, PartialSumSq, NormWeight, Out, stride_w_s, T, norm_eps,
-+    D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, N_DBLK: tl.constexpr,
++    D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
++    N_DBLK: tl.constexpr, G_POW2: tl.constexpr,
 +):
 +    t_blk = tl.program_id(0)
 +    d_blk = tl.program_id(1)
@@ -11859,7 +13604,7 @@ index 0000000..23a6f27
 +    t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
 +    d = d_blk * BD + tl.arange(0, BD)
 +    t_mask = t < T
-+    g = tl.arange(0, 16)
++    g = tl.arange(0, G_POW2)
 +    g_mask = g < N_DBLK
 +    psq = tl.load(
 +        PartialSumSq + (s * N_DBLK + g[:, None]) * T + t[None, :],
@@ -11896,22 +13641,463 @@ index 0000000..23a6f27
 +    ):
 +        return None
 +    blended = message.new_empty(message.shape, dtype=torch.bfloat16)
-+    partial_sum_sq = message.new_empty((streams, 9, t_len), dtype=torch.float32)
 +    out = message.new_empty(message.shape, dtype=torch.bfloat16)
-+    bt = 16 if t_len <= 32 else 32
-+    _fused_loop_blend_p1_kernel[(triton.cdiv(t_len, bt), 9, streams)](
++    if t_len <= 64:
++        n_dblk, d_per_blk, g_pow2 = 36, 64, 64
++        bt = 16 if t_len <= 16 else (32 if t_len <= 32 else 64)
++    else:
++        n_dblk, d_per_blk, g_pow2 = 9, 256, 16
++        bt = 32
++    partial_sum_sq = message.new_empty((streams, n_dblk, t_len), dtype=torch.float32)
++    _fused_loop_blend_p1_kernel[(triton.cdiv(t_len, bt), n_dblk, streams)](
 +        hidden, weight, dest, message, blended, partial_sum_sq,
 +        *dest.stride()[:2], *message.stride()[:2], t_len,
-+        D=width, BT=bt, BD=64, D_PER_BLK=256, N_DBLK=9, num_warps=4,
++        D=width, BT=bt, BD=64, D_PER_BLK=d_per_blk, N_DBLK=n_dblk, num_warps=4,
 +    )
 +    _fused_loop_blend_p2_kernel[(triton.cdiv(t_len, bt), width // 128, streams)](
 +        blended, partial_sum_sq, norm_weight, out, norm_weight.stride(0), t_len, norm_eps,
-+        D=width, BT=bt, BD=128, N_DBLK=9, num_warps=4,
++        D=width, BT=bt, BD=128, N_DBLK=n_dblk, G_POW2=g_pow2, num_warps=4,
++    )
++    return out
++
++
++# ============================================================================
++# 10. SPLIT CONTIGUOUS ATTENTION PROLOGUE (STRIDED [H,T+128,E] + SKIP-CACHE KV)
++# ============================================================================
++
++@triton.jit
++def _fast_qr_rel_strided_kernel(
++    Q, R, QScale, RScale, Tau, RelProj, QOut, RelOut,
++    SeqIdx, CuSeqlensQ, SeqLens,
++    T, stride_q, stride_r, stride_rel_t, stride_rel_h,
++    q_threshold, r_threshold, eps,
++    H: tl.constexpr, D: tl.constexpr, D_REL: tl.constexpr,
++    E: tl.constexpr, W: tl.constexpr, HAS_TAU: tl.constexpr,
++    BLOCK_H: tl.constexpr, BLOCK_E: tl.constexpr,
++):
++    t = tl.program_id(0).to(tl.int64)
++    if t >= T:
++        return
++    E_PAD: tl.constexpr = E + 256
++    heads = tl.arange(0, BLOCK_H)[:, None]
++    h_mask = heads < H
++    tau = tl.load(Tau + t) if HAS_TAU else 1.0
++
++    q_cols = tl.arange(0, D)[None, :]
++    q = _l2_clip(Q + t * stride_q, QScale, heads, q_cols, h_mask, q_threshold, eps, tau, HAS_TAU)
++    tl.store(QOut + t * H * D + heads * D + q_cols, q, h_mask)
++
++    r_cols = tl.arange(0, D_REL)[None, :]
++    r = _l2_clip(R + t * stride_r, RScale, heads, r_cols, h_mask, r_threshold, eps, tau, HAS_TAU)
++
++    seq = tl.load(SeqIdx + t)
++    q_start = tl.load(CuSeqlensQ + seq)
++    q_len = tl.load(CuSeqlensQ + seq + 1) - q_start
++    q_idx = t - q_start
++    pos = tl.load(SeqLens + seq) - q_len + q_idx
++    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
++    diag = pos + E_PAD - tl.cdiv(pos - q_idx + tile_end, 128) * 128
++    diag = tl.minimum(tl.maximum(diag, E + 1), E_PAD - 1)
++    diag8 = diag // 8 * 8
++    table = RelProj + (diag - diag8) * (D_REL + 1) * W + E + 256 - diag8
++    e_idx = tl.arange(0, BLOCK_E)[None, :]
++    out_base = RelOut + t * stride_rel_t + heads.to(tl.int64) * stride_rel_h
++    for chunk in tl.static_range(E_PAD // BLOCK_E):
++        col = chunk * BLOCK_E + e_idx
++        proj = tl.load(table + tl.trans(r_cols) * W + col)
++        pad = tl.load(table + D_REL * W + col)
++        rel = tl.dot(r, proj) + pad.to(tl.float32)
++        tl.store(out_base + col, rel.to(RelOut.dtype.element_ty), h_mask)
++
++
++@triton.jit
++def _kv_conv_tile_skip_kernel(
++    k_ptr, v_ptr, wk_ptr, wv_ptr, dk_ptr, dv_ptr,
++    cache_ptr, key_cache_ptr, value_cache_ptr, kv_slot_ptr,
++    pos_ptr, seq_idx_ptr, slot_ptr, block_table_ptr, qstart_ptr,
++    T, stride_k, stride_v, stride_w0, stride_w1, stride_dk, stride_dv,
++    stride_c_blk, stride_c_h, stride_c_n,
++    stride_kv_blk, stride_kv_n, stride_kv_h, kv_block_size,
++    stride_bt, max_blocks, N, scale, clip_threshold, clip_eps, norm_eps,
++    W: tl.constexpr, D: tl.constexpr, DYNAMIC: tl.constexpr,
++    BT: tl.constexpr, SKIP_IDLE_CACHE: tl.constexpr,
++):
++    first = tl.program_id(0) * BT
++    tile_reads_cache = True
++    if SKIP_IDLE_CACHE:
++        last = tl.minimum(first + BT, T) - 1
++        tile_reads_cache = tl.load(qstart_ptr + last) > first - (W - 1)
++    toff = first + tl.arange(0, BT)
++    head = tl.program_id(1)
++    is_v = tl.program_id(2) == 1
++    d_idx = tl.arange(0, D)
++    coff = head * D + d_idx
++    t_mask = toff < T
++    if is_v:
++        x_ptr, w_ptr, dyn_ptr, stride_x, stride_dyn = v_ptr, wv_ptr, dv_ptr, stride_v, stride_dv
++    else:
++        x_ptr, w_ptr, dyn_ptr, stride_x, stride_dyn = k_ptr, wk_ptr, dk_ptr, stride_k, stride_dk
++    y = _conv(
++        x_ptr, stride_x, cache_ptr, head * stride_c_h + tl.program_id(2) * D + d_idx,
++        stride_c_blk, stride_c_n, N, w_ptr, stride_w0, stride_w1,
++        pos_ptr, seq_idx_ptr, slot_ptr, block_table_ptr, stride_bt, max_blocks,
++        qstart_ptr, scale, toff, coff, t_mask, d_idx < D,
++        W, dyn_ptr if DYNAMIC else None, stride_dyn, D,
++        SKIP_IDLE_CACHE=SKIP_IDLE_CACHE,
++        CACHE_FIRST=False,
++        tile_reads_cache=tile_reads_cache,
++    )
++    y = y.to(k_ptr.dtype.element_ty).to(tl.float32)
++    sum_sq = tl.sum(y * y, axis=1)
++    if is_v:
++        y = y * tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)[:, None]
++        cache = value_cache_ptr
++    else:
++        norm = tl.where(sum_sq > 0, sum_sq * tl.rsqrt(sum_sq), 0.0)
++        y = y * tl.minimum(tl.div_rn(clip_threshold, norm + clip_eps), 1.0)[:, None]
++        cache = key_cache_ptr
++    kv_slot = tl.load(kv_slot_ptr + toff, mask=t_mask, other=-1)
++    safe = tl.maximum(kv_slot, 0)
++    dst = (
++        cache + (safe // kv_block_size)[:, None] * stride_kv_blk
++        + (safe % kv_block_size)[:, None] * stride_kv_n
++        + head * stride_kv_h + d_idx[None, :]
++    )
++    tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
++
++
++def turbo_attention_prologue(
++    q: torch.Tensor, r: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
++    q_scale: torch.Tensor, r_scale: torch.Tensor, tau: torch.Tensor | None,
++    rel_proj: torch.Tensor, k_weight: torch.Tensor, v_weight: torch.Tensor,
++    k_dynamic: torch.Tensor | None, v_dynamic: torch.Tensor | None,
++    cache: torch.Tensor, positions: torch.Tensor, block_table: torch.Tensor,
++    seq_idx: torch.Tensor, slot_mapping: torch.Tensor, query_start: torch.Tensor,
++    key_cache: torch.Tensor, value_cache: torch.Tensor, kv_slot_mapping: torch.Tensor,
++    q_out: torch.Tensor, rel_out: torch.Tensor, cu_seqlens_q: torch.Tensor,
++    seq_lens: torch.Tensor, *,
++    clip_threshold: float, rel_threshold: float, norm_eps: float, clip_eps: float = 1e-6,
++) -> None:
++    num_tokens = kv_slot_mapping.shape[0]
++    num_heads, head_dim = key_cache.shape[2:]
++    num_q_heads, d_rel = r.shape[1:]
++    extent = rel_proj.shape[2] - 512
++    dynamic = k_dynamic is not None
++    if dynamic:
++        width = k_weight.shape[0]
++        dyn_strides = (k_dynamic.stride(0), v_dynamic.stride(0))
++    else:
++        width = k_weight.shape[1]
++        dyn_strides = (0, 0)
++    block_e = min(extent, 256)
++    _fast_qr_rel_strided_kernel[(num_tokens,)](
++        q, r, q_scale, r_scale, tau, rel_proj, q_out, rel_out,
++        seq_idx, cu_seqlens_q, seq_lens, num_tokens,
++        q.stride(0), r.stride(0), rel_out.stride(0), rel_out.stride(1),
++        clip_threshold, rel_threshold, clip_eps,
++        H=num_q_heads, D=head_dim, D_REL=d_rel, E=extent, W=rel_proj.shape[2],
++        HAS_TAU=tau is not None, BLOCK_H=max(triton.next_power_of_2(num_q_heads), 16),
++        BLOCK_E=block_e, num_warps=8, enable_fp_fusion=False,
++    )
++    prefill = num_tokens > 256
++    scale = (width * (2 if dynamic else 1) + 1) ** -0.5
++    if prefill:
++        from .hip_moe_prefill import hip_kv_conv_prefill
++
++        if hip_kv_conv_prefill(
++            k, v, k_weight, v_weight, k_dynamic, v_dynamic,
++            cache, key_cache, value_cache, kv_slot_mapping,
++            positions, seq_idx, slot_mapping, block_table, query_start,
++            num_tokens=num_tokens, num_heads=num_heads, head_dim=head_dim,
++            width=width, scale=scale, clip_threshold=clip_threshold,
++            clip_eps=clip_eps, norm_eps=norm_eps,
++        ):
++            return
++    bt = (64 if not dynamic else 16) if prefill else 4
++    _kv_conv_tile_skip_kernel[(triton.cdiv(num_tokens, bt), num_heads, 2)](
++        k, v, k_weight, v_weight,
++        k_dynamic if dynamic else k_weight,
++        v_dynamic if dynamic else v_weight,
++        cache, key_cache, value_cache, kv_slot_mapping,
++        positions, seq_idx, slot_mapping, block_table, query_start,
++        num_tokens, k.stride(0), v.stride(0), k_weight.stride(0), k_weight.stride(1),
++        *dyn_strides,
++        cache.stride(0), cache.stride(1), cache.stride(2),
++        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
++        key_cache.shape[1], block_table.stride(0), block_table.shape[1], cache.shape[2],
++        scale, clip_threshold, clip_eps, norm_eps,
++        W=width, D=head_dim, DYNAMIC=dynamic, BT=bt, SKIP_IDLE_CACHE=prefill,
++        num_warps=4, enable_fp_fusion=False,
++    )
++
++
++# ============================================================================
++# 10. PREFILL ROUTER BF16-WMMA->FP32 & ALL-IN-ONE FUSED LOOP CONTROLLER
++# ============================================================================
++
++@triton.jit
++def _router_prefill_bf16_to_fp32_kernel(
++    X, W, Bias, Score, Corrected,
++    T, K: tl.constexpr, N: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr,
++):
++    t_blk = tl.program_id(0)
++    t = t_blk * BT + tl.arange(0, BT)
++    t_mask = t < T
++    n = tl.arange(0, N)
++    acc = tl.zeros((BT, N), tl.float32)
++    for k0 in range(0, K, BK):
++        k = k0 + tl.arange(0, BK)
++        x = tl.load(X + t[:, None].to(tl.int64) * K + k[None, :], t_mask[:, None], other=0)
++        w = tl.load(W + n[None, :].to(tl.int64) * K + k[:, None])
++        acc = tl.dot(x, w, acc)
++    score = tl.div_rn(1.0, 1.0 + tl_hip_lib.exp(-acc))
++    bias = tl.load(Bias + n)
++    corr = score + bias[None, :]
++    tl.store(Score + t[:, None].to(tl.int64) * N + n[None, :], score, t_mask[:, None])
++    tl.store(Corrected + t[:, None].to(tl.int64) * N + n[None, :], corr, t_mask[:, None])
++
++
++def router_scores_prefill(
++    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor] | None:
++    if (
++        not x.is_cuda
++        or x.ndim != 2
++        or x.shape[0] < 64
++        or x.shape[1] != 2304
++        or weight.shape != (128, 2304)
++        or bias.shape != (128,)
++        or x.dtype != torch.bfloat16
++        or weight.dtype != torch.bfloat16
++        or bias.dtype != torch.float32
++        or not x.is_contiguous()
++        or not weight.is_contiguous()
++        or not bias.is_contiguous()
++    ):
++        return None
++    t_len = x.shape[0]
++    score = x.new_empty((t_len, 128), dtype=torch.float32)
++    corrected = x.new_empty((t_len, 128), dtype=torch.float32)
++    bt = 128 if t_len >= 512 else 64
++    nw = 8 if bt == 128 else 4
++    _router_prefill_bf16_to_fp32_kernel[(triton.cdiv(t_len, bt),)](
++        x, weight, bias, score, corrected, t_len, K=2304, N=128, BT=bt, BK=64, num_warps=nw,
++    )
++    return score, corrected
++
++
++@triton.jit
++def _fused_loop_allinone_kernel(
++    Dest, Msg, WdownT, Wup, NormW, Out,
++    sd_s, sd_t, sm_s, sm_t, sw_s,
++    T, norm_eps, D: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr,
++):
++    t_blk = tl.program_id(0)
++    s = tl.program_id(1).to(tl.int64)
++    t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
++    t_mask = t < T
++    r = tl.arange(0, 64)
++    acc_d = tl.zeros((BT, 64), tl.float32)
++    acc_m = tl.zeros((BT, 64), tl.float32)
++    sq_d = tl.zeros((BT,), tl.float32)
++    sq_m = tl.zeros((BT,), tl.float32)
++    wd_base = WdownT + s * (2 * D * 64)
++    for k0 in range(0, D, BK):
++        k = k0 + tl.arange(0, BK)
++        d_val = tl.load(Dest + s * sd_s + t[:, None] * sd_t + k[None, :], t_mask[:, None], other=0.0)
++        m_val = tl.load(Msg + s * sm_s + t[:, None] * sm_t + k[None, :], t_mask[:, None], other=0.0)
++        sq_d += tl.sum(d_val * d_val, axis=1)
++        sq_m += tl.sum(m_val * m_val, axis=1)
++        wd = tl.load(wd_base + k[:, None] * 64 + r[None, :])
++        wm = tl.load(wd_base + (D + k[:, None]) * 64 + r[None, :])
++        acc_d += tl.dot(d_val.to(tl.bfloat16), wd)
++        acc_m += tl.dot(m_val.to(tl.bfloat16), wm)
++    rstd_d = tl_hip_lib.rsqrt(tl.div_rn(sq_d, D) + 1e-6)
++    rstd_m = tl_hip_lib.rsqrt(tl.div_rn(sq_m, D) + 1e-6)
++    hidden = (acc_d * rstd_d[:, None] + acc_m * rstd_m[:, None]).to(tl.bfloat16)
++
++    wu_base = Wup + s * (2 * D * 64)
++    sq_b = tl.zeros((BT,), tl.float32)
++    out_base = Out + (s * T + t[:, None]) * D
++    for k0 in range(0, D, BK):
++        k = k0 + tl.arange(0, BK)
++        wg = tl.load(wu_base + k[:, None] * 64 + r[None, :])
++        wf = tl.load(wu_base + (D + k[:, None]) * 64 + r[None, :])
++        gain = tl_hip_lib.tanh(tl.dot(hidden, tl.trans(wg)))
++        forget = tl_hip_lib.tanh(tl.dot(hidden, tl.trans(wf)))
++        d_val = tl.load(Dest + s * sd_s + t[:, None] * sd_t + k[None, :], t_mask[:, None], other=0.0)
++        m_val = tl.load(Msg + s * sm_s + t[:, None] * sm_t + k[None, :], t_mask[:, None], other=0.0)
++        b = (1.0 - forget) * d_val + gain * m_val
++        sq_b += tl.sum(b * b, axis=1)
++        tl.store(out_base + k[None, :], b.to(tl.bfloat16), t_mask[:, None])
++    rstd_b = tl_hip_lib.rsqrt(tl.div_rn(sq_b, D) + norm_eps)
++    nw_base = NormW + s * sw_s
++    for k0 in range(0, D, BK):
++        k = k0 + tl.arange(0, BK)
++        b = tl.load(out_base + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
++        nw = tl.load(nw_base + k).to(tl.float32)
++        tl.store(out_base + k[None, :], (b * rstd_b[:, None] * nw[None, :]).to(tl.bfloat16), t_mask[:, None])
++
++
++def fused_loop_allinone_prefill(
++    dest: torch.Tensor,
++    message: torch.Tensor,
++    down_weight_t: torch.Tensor,
++    up_weight: torch.Tensor,
++    norm_weight: torch.Tensor,
++    norm_eps: float,
++) -> torch.Tensor | None:
++    from .loop import _packed_rows
++
++    if not _packed_rows(dest, message):
++        return None
++    streams, t_len, width = message.shape
++    if (
++        t_len < 64
++        or width != 2304
++        or down_weight_t.shape != (streams, 2 * width, 64)
++        or up_weight.shape != (streams, 2 * width, 64)
++        or down_weight_t.dtype != torch.bfloat16
++        or up_weight.dtype != torch.bfloat16
++        or not down_weight_t.is_contiguous()
++        or not up_weight.is_contiguous()
++        or norm_weight.shape != (streams, width)
++        or norm_weight.stride(-1) != 1
++    ):
++        return None
++    out = message.new_empty(message.shape, dtype=torch.bfloat16)
++    bt = 16
++    _fused_loop_allinone_kernel[(triton.cdiv(t_len, bt), streams)](
++        dest, message, down_weight_t, up_weight, norm_weight, out,
++        *dest.stride()[:2], *message.stride()[:2], norm_weight.stride(0),
++        t_len, norm_eps, D=width, BT=bt, BK=64, num_warps=4,
++    )
++    return out
++
++
++@triton.jit
++def _turbo_fast_tanh(x):
++    ax = tl.abs(x)
++    e = tl.math.exp2(-2.8853900817779268 * ax)
++    t = (1.0 - e) / (1.0 + e)
++    return tl.where(x >= 0.0, t, -t)
++
++
++@triton.jit
++def _fused_loop_zeromat_kernel(
++    Dest, Bank0, Bank1, Coeffs, WdownT, Wup, NormW, Out,
++    sd_s, sd_t, sb0, sb1, sc_s, sw_s,
++    T, norm_eps, D: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr,
++):
++    # Grid=(streams, cdiv(T, BT)) keeps all S streams for the same token block
++    # co-scheduled across CUs for high L2/MALL reuse of Dest, Bank0, and Bank1.
++    s = tl.program_id(0).to(tl.int64)
++    t_blk = tl.program_id(1)
++    t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
++    t_mask = t < T
++    r = tl.arange(0, 64)
++
++    c0 = tl.load(Coeffs + s * sc_s + t * 2 + 0, t_mask, other=0.0)
++    c1 = tl.load(Coeffs + s * sc_s + t * 2 + 1, t_mask, other=0.0)
++
++    acc_d = tl.zeros((BT, 64), tl.float32)
++    acc_m = tl.zeros((BT, 64), tl.float32)
++    sq_d = tl.zeros((BT,), tl.float32)
++    sq_m = tl.zeros((BT,), tl.float32)
++    wd_base = WdownT + s * (2 * D * 64)
++    for k0 in range(0, D, BK):
++        k = k0 + tl.arange(0, BK)
++        d_val = tl.load(Dest + s * sd_s + t[:, None] * sd_t + k[None, :], t_mask[:, None], other=0.0)
++        b0 = tl.load(Bank0 + t[:, None] * sb0 + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
++        b1 = tl.load(Bank1 + t[:, None] * sb1 + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
++        m_val = c0[:, None] * b0 + c1[:, None] * b1
++        sq_d += tl.sum(d_val * d_val, axis=1)
++        sq_m += tl.sum(m_val * m_val, axis=1)
++        wd = tl.load(wd_base + k[:, None] * 64 + r[None, :])
++        wm = tl.load(wd_base + (D + k[:, None]) * 64 + r[None, :])
++        acc_d += tl.dot(d_val.to(tl.bfloat16), wd)
++        acc_m += tl.dot(m_val.to(tl.bfloat16), wm)
++    rstd_d = tl_hip_lib.rsqrt(tl.div_rn(sq_d, D) + 1e-6)
++    rstd_m = tl_hip_lib.rsqrt(tl.div_rn(sq_m, D) + 1e-6)
++    hidden = (acc_d * rstd_d[:, None] + acc_m * rstd_m[:, None]).to(tl.bfloat16)
++
++    wu_base = Wup + s * (2 * D * 64)
++    sq_b = tl.zeros((BT,), tl.float32)
++    out_base = Out + (s * T + t[:, None]) * D
++    for k0 in range(0, D, BK):
++        k = k0 + tl.arange(0, BK)
++        wg = tl.load(wu_base + k[:, None] * 64 + r[None, :])
++        wf = tl.load(wu_base + (D + k[:, None]) * 64 + r[None, :])
++        gain = _turbo_fast_tanh(tl.dot(hidden, tl.trans(wg)))
++        forget = _turbo_fast_tanh(tl.dot(hidden, tl.trans(wf)))
++        d_val = tl.load(Dest + s * sd_s + t[:, None] * sd_t + k[None, :], t_mask[:, None], other=0.0)
++        b0 = tl.load(Bank0 + t[:, None] * sb0 + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
++        b1 = tl.load(Bank1 + t[:, None] * sb1 + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
++        m_val = c0[:, None] * b0 + c1[:, None] * b1
++        b = (1.0 - forget) * d_val + gain * m_val
++        sq_b += tl.sum(b * b, axis=1)
++        tl.store(out_base + k[None, :], b.to(tl.bfloat16), t_mask[:, None])
++    rstd_b = tl_hip_lib.rsqrt(tl.div_rn(sq_b, D) + norm_eps)
++    nw_base = NormW + s * sw_s
++    for k0 in range(0, D, BK):
++        k = k0 + tl.arange(0, BK)
++        b = tl.load(out_base + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
++        nw = tl.load(nw_base + k).to(tl.float32)
++        tl.store(out_base + k[None, :], (b * rstd_b[:, None] * nw[None, :]).to(tl.bfloat16), t_mask[:, None])
++
++
++def fused_loop_zeromat_prefill(
++    dest: torch.Tensor,
++    bank0: torch.Tensor,
++    bank1: torch.Tensor,
++    coeffs: torch.Tensor,
++    down_weight_t: torch.Tensor,
++    up_weight: torch.Tensor,
++    norm_weight: torch.Tensor,
++    norm_eps: float,
++) -> torch.Tensor | None:
++    if (
++        not dest.is_cuda
++        or dest.ndim != 3
++        or dest.dtype != torch.float32
++        or dest.stride(-1) != 1
++        or bank0.dtype != torch.bfloat16
++        or bank1.dtype != torch.bfloat16
++        or coeffs.dtype != torch.float32
++        or not coeffs.is_contiguous()
++    ):
++        return None
++    streams, t_len, width = dest.shape
++    if (
++        t_len < 64
++        or width != 2304
++        or streams not in (1, 3)
++        or bank0.shape != (t_len, width)
++        or bank1.shape != (t_len, width)
++        or bank0.stride(-1) != 1
++        or bank1.stride(-1) != 1
++        or coeffs.shape != (streams, t_len, 2)
++        or down_weight_t.shape != (streams, 2 * width, 64)
++        or up_weight.shape != (streams, 2 * width, 64)
++        or down_weight_t.dtype != torch.bfloat16
++        or up_weight.dtype != torch.bfloat16
++        or not down_weight_t.is_contiguous()
++        or not up_weight.is_contiguous()
++        or norm_weight.shape != (streams, width)
++        or norm_weight.stride(-1) != 1
++    ):
++        return None
++    out = bank0.new_empty((streams, t_len, width), dtype=torch.bfloat16)
++    bt = 16
++    _fused_loop_zeromat_kernel[(streams, triton.cdiv(t_len, bt))](
++        dest, bank0, bank1, coeffs, down_weight_t, up_weight, norm_weight, out,
++        *dest.stride()[:2], bank0.stride(0), bank1.stride(0), coeffs.stride(0), norm_weight.stride(0),
++        t_len, norm_eps, D=width, BT=bt, BK=64, num_warps=4,
 +    )
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/vision.py b/vllm/models/inkling2/amd/ops/vision.py
 new file mode 100644
-index 0000000..7c3d0c9
+index 00000000..7c3d0c96
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/vision.py
 @@ -0,0 +1,331 @@
@@ -12248,7 +14434,7 @@ index 0000000..7c3d0c9
 +    return normed
 diff --git a/vllm/models/inkling2/amd/sconv.py b/vllm/models/inkling2/amd/sconv.py
 new file mode 100644
-index 0000000..a7f6dee
+index 00000000..a7f6deeb
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/sconv.py
 @@ -0,0 +1,143 @@
@@ -12397,7 +14583,7 @@ index 0000000..a7f6dee
 +        )
 diff --git a/vllm/models/inkling2/amd/vision.py b/vllm/models/inkling2/amd/vision.py
 new file mode 100644
-index 0000000..e90e92d
+index 00000000..e90e92d2
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/vision.py
 @@ -0,0 +1,286 @@
@@ -12688,7 +14874,7 @@ index 0000000..e90e92d
 +                loaded.add(name)
 +        return loaded | {name for name, count in qkv_shards.items() if count == 3}
 diff --git a/vllm/models/inkling2/speculator.py b/vllm/models/inkling2/speculator.py
-index 6beae2b..c5f9d71 100644
+index 6beae2b0..c5f9d719 100644
 --- a/vllm/models/inkling2/speculator.py
 +++ b/vllm/models/inkling2/speculator.py
 @@ -1,8 +1,11 @@
@@ -12910,7 +15096,7 @@ index 6beae2b..c5f9d71 100644
              state, bias = self.model.markov_step(state, prev, context[i])
              if self.draft_logits is None:
 diff --git a/vllm/platforms/rocm.py b/vllm/platforms/rocm.py
-index d5d26df..3d0f77a 100644
+index d5d26dfc..3d0f77ab 100644
 --- a/vllm/platforms/rocm.py
 +++ b/vllm/platforms/rocm.py
 @@ -1,5 +1,6 @@
@@ -12929,7 +15115,7 @@ index d5d26df..3d0f77a 100644
          "auto_awq",
          "awq_marlin",  # will be overwritten with awq
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 0373c64..74f99dd 100644
+index 0373c647..74f99dde 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -1,6 +1,8 @@
@@ -13013,7 +15199,7 @@ index 0373c64..74f99dd 100644
              scheduled_new_reqs=new_reqs_data,
              scheduled_cached_reqs=cached_reqs_data,
 diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index 52243d4..cb6ba17 100644
+index 52243d49..cb6ba178 100644
 --- a/vllm/v1/worker/gpu/cudagraph_utils.py
 +++ b/vllm/v1/worker/gpu/cudagraph_utils.py
 @@ -1,7 +1,9 @@
@@ -13060,7 +15246,7 @@ index 52243d4..cb6ba17 100644
                          # PIECEWISE graph (compiled PW or breakable, chosen inside
                          # run_pw_graph).
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 1f831da..5328875 100644
+index 1f831da6..53288759 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -1,5 +1,6 @@
@@ -13228,7 +15414,7 @@ index 1f831da..5328875 100644
                  self.pcp_manager.sync_drafts(
                      draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index 875646f..5449d9e 100644
+index 875646f3..5449d9ea 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 @@ -1,5 +1,6 @@

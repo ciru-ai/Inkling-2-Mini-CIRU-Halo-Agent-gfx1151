@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 vllm_repo=https://github.com/ciru-ai/vllm.git
-vllm_revision=c95dbfa9cf4e6cbe94f9691e9febc868a217ecd7
+vllm_revision=dfa00c925b4bf4269a1ed27fcb72a44f7210aa23
 transformers_repo=https://github.com/huggingface/transformers.git
 transformers_revision=6173a2f679ff4ed393afc499aefc569da7e68bc1
 model_repo=jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151

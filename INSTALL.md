@@ -42,7 +42,7 @@ The last command should display a HIP version and an architecture beginning with
 ```bash
 git clone https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151.git
 cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
-INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.3.1"
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.4.0"
 INKLING_MODEL="$HOME/models/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151"
 
 bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
@@ -50,19 +50,19 @@ bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
   --prefix "$INKLING_ROOT" --download-model "$INKLING_MODEL"
 ```
 
-The installer verifies the package and model checksums, retrieves the pinned [vLLM runtime](https://github.com/ciru-ai/vllm/commit/c95dbfa9cf4e6cbe94f9691e9febc868a217ecd7) and [Transformers support](https://github.com/huggingface/transformers/commit/6173a2f679ff4ed393afc499aefc569da7e68bc1), and links the ROCm extensions into the standalone prefix. The launcher reuses the virtual environment. If you already have the complete [Hugging Face bundle](https://huggingface.co/jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151), omit `--download-model` and point the launcher at your copy.
+The installer verifies the package and model checksums, retrieves the pinned [vLLM runtime](https://github.com/ciru-ai/vllm/commit/dfa00c925b4bf4269a1ed27fcb72a44f7210aa23) and [Transformers support](https://github.com/huggingface/transformers/commit/6173a2f679ff4ed393afc499aefc569da7e68bc1), installs the bundled portable `gfx1151` HIP prefill library (`scripts/rocm/hip_moe_prefill_gfx1151_80df0ef12be2.so`, requiring no `hipcc` or `rocm-sdk-devel`), and links the ROCm extensions into the standalone prefix. The launcher reuses the virtual environment. If you already have the complete [Hugging Face bundle](https://huggingface.co/jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151), omit `--download-model` and point the launcher at your copy.
 
 You can also run `bash scripts/install.sh` from the root of the complete Hugging Face download.
 
-### Upgrading from v1.2.x or v1.3.0 to v1.3.1
+### Upgrading from v1.2.x or v1.3.x to v1.4.0
 
 Your existing model and fitted weight files (`WEIGHTS.sha256`) are unchanged and do not need to be re-downloaded. Update the runtime repo, install into the new prefix, and restart the server:
 
 ```bash
 cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
 git fetch origin --tags
-git switch --detach v1.3.1
-INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.3.1"
+git switch --detach v1.4.0
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.4.0"
 
 bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
   --transformers-deps "$HOME/.local/share/inkling-halo/transformers-deps" \
@@ -73,7 +73,7 @@ Use `bash scripts/install.sh --verify-only` to check package integrity without d
 
 ## 3. Serve
 
-Start the default all-in-one server with native ROCm vision, prefix caching, native tool calling, 8 concurrent sequences, 1,048,576-token context (52 GiB BF16 KV cache), FULL Target + Draft HIP graphs, and dual-depth adaptive DSpark speculation (`K=7` at `B=1`, `K=4` at `B=2..8`). Fitted weights are enabled automatically when the model directory includes them, and greedy draft proposals support both `temperature = 0` and `temperature > 0` losslessly via exact rejection sampling.
+Start the default all-in-one server with native RDNA 3.5 HIP prefill acceleration, native ROCm vision, prefix caching, native tool calling, 8 concurrent sequences, 1,048,576-token context (52 GiB BF16 KV cache), FULL Target + Draft HIP graphs, and dual-depth adaptive DSpark speculation (`K=7` at `B=1`, `K=4` at `B=2..8`). Fitted weights are enabled automatically when the model directory includes them, and greedy draft proposals support both `temperature = 0` and `temperature > 0` losslessly via exact rejection sampling.
 
 ```bash
 "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --tools
@@ -89,12 +89,18 @@ python3 scripts/smoke-test.py --check-tools
 
 The API base URL is `http://127.0.0.1:18753/v1` and the model ID is `main`. The first launch builds a local Triton kernel cache and may take longer. Use `--dry-run` to preview the selected launch settings.
 
-Start the server through `serve.sh` to load the corrected ROCr library for the pinned ROCm 10.0 SDK. The launcher checks the SDK and library checksums. The backport was built on Ubuntu 24.04 LTS and tested on NixOS with one visible Strix Halo GPU. On multi-GPU hosts, use `ROCR_VISIBLE_DEVICES` to expose only the Strix Halo GPU. [AMD ROCr fix](https://github.com/ROCm/rocm-systems/pull/7898)
+Start the server through `serve.sh` to load both the prebuilt native `gfx1151` HIP prefill library (`hip_moe_prefill_gfx1151_80df0ef12be2.so`) and the corrected ROCr library for the pinned ROCm 10.0 SDK. The launcher checks the SDK and library checksums. On multi-GPU hosts, use `ROCR_VISIBLE_DEVICES` to expose only the Strix Halo GPU. [AMD ROCr fix](https://github.com/ROCm/rocm-systems/pull/7898)
 
 Set `--context` to override the request limit. The launcher sizes the KV pool from that limit unless you set `--kv-mib` explicitly. Choose a smaller context and cache budget on systems with less available memory.
 
 ```bash
 "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --context 32768 --kv-mib 24576 --tools
+```
+
+For maximum throughput on long `8K–64K` prompts (trading ~135 tok/s on short `2K–4K` prompts for `+40–65 tok/s` across `8K–58K`), pass `--batch-tokens 8192`:
+
+```bash
+"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --batch-tokens 8192 --tools
 ```
 
 ### Send an image to the default server
