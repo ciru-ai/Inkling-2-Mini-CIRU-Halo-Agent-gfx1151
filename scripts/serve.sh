@@ -14,19 +14,19 @@ Required:
 
 Modes & Serving Options:
   --mode MODE             single (default, single-stream HIP graph),
-                          long-context (single-stream HIP graph, 66,048 tokens),
+                          long-context (single-stream HIP graph),
                           concurrent (eager greedy DSpark, 8 sequences),
                           sampling (eager probabilistic DSpark),
-                          vision (image and text input, 32,768 tokens, 8 sequences)
+                          vision (image and text input, 8 sequences)
   --served-model-name ID  OpenAI API model name (default: main)
   --host HOST             Bind host (default: 127.0.0.1)
   --port PORT             Bind port (default: 18753)
-  --context N             Max prompt + completion tokens for a request
+  --context N             Max prompt + completion tokens (default: 1048576)
   --seqs N                Max concurrent sequences (default: 1; 8 in concurrent/vision)
   --batch-tokens N        Scheduler max_num_batched_tokens (default: 4096)
   --prefill-chunk-tokens N
                           Optional --long-prefill-token-threshold cap
-  --kv-mib N              BF16 KV cache budget in MiB (auto-sized in 6144 MiB / 16K steps)
+  --kv-mib N              BF16 KV cache budget in MiB (default: sized for context)
   --spec-tokens K         DSpark draft depth 1..7 (default: 7)
   --no-spec               Disable DSpark speculative decoding
   --prefix-cache          Enable vLLM prefix caching (enabled in vision mode)
@@ -125,13 +125,7 @@ for number in "$port" "$batch_tokens" "$spec_tokens" ${context:+"$context"} ${se
 done
 (( port <= 65535 && spec_tokens <= 7 )) || die 'port must be at most 65535 and draft depth at most 7'
 
-if [[ -z "$context" ]]; then
-    case "$mode" in
-        long-context) context=66048 ;;
-        vision) context=32768 ;;
-        *) context=4096 ;;
-    esac
-fi
+context=${context:-1048576}
 if [[ -z "$seqs" ]]; then
     if [[ "$mode" == concurrent || "$mode" == vision ]]; then seqs=8; else seqs=1; fi
 fi
@@ -161,14 +155,15 @@ if [[ -z "$python_bin" ]]; then
     fi
 fi
 
-if [[ "$mode" == single ]] && (( context > 4096 )); then
-    die 'Use --mode long-context for single-request HIP graph contexts above 4096 tokens'
-fi
 if [[ "$mode" == single || "$mode" == long-context ]] && (( seqs != 1 )); then
     die 'Use --mode concurrent for multiple sequences'
 fi
 if [[ -z "$kv_mib" ]]; then
-    if [[ "$mode" == long-context && "$context" == 66048 ]]; then
+    if (( context > 66048 )); then
+        # Nine full-history BF16 cache visits with DSpark use 36 KiB per
+        # token. Reserve an additional 16 GiB for windowed groups and slack.
+        kv_mib=$((16384 + 36 * ((context + 1023) / 1024)))
+    elif [[ "$mode" == long-context && "$context" == 66048 ]]; then
         kv_mib=28672
     elif [[ "$mode" == vision && "$context" == 32768 ]]; then
         kv_mib=24576
@@ -204,7 +199,8 @@ esac
 if [[ "$mode" == vision ]]; then
     prefix_cache=1
 fi
-if [[ "$mode" == single ]]; then
+# The copy-draft optimization applies only to the short seven-draft graph.
+if [[ "$mode" == single ]] && (( context <= 4096 && spec_tokens == 7 )); then
     copy_draft="$target_graph"
 fi
 if [[ "$draft_graph" == auto ]]; then

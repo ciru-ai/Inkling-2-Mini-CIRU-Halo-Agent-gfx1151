@@ -42,7 +42,7 @@ The last command should display a HIP version and an architecture beginning with
 ```bash
 git clone https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151.git
 cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
-INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.1"
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.2"
 INKLING_MODEL="$HOME/models/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151"
 
 bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
@@ -52,13 +52,13 @@ bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
 
 The installer verifies the package and model checksums, retrieves the pinned [vLLM runtime](https://github.com/ciru-ai/vllm/commit/7c4aa8b5b1d9aed94f4bfadcc38593a1f782066a) and [Transformers support](https://github.com/huggingface/transformers/commit/6173a2f679ff4ed393afc499aefc569da7e68bc1), and links the ROCm extensions into the standalone prefix. The launcher reuses the virtual environment. If you already have the complete [Hugging Face bundle](https://huggingface.co/jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151), omit `--download-model` and point the launcher at your copy.
 
-When upgrading from v1.0.0, run `git fetch origin --tags` and `git switch --detach v1.1.0` from your existing clone. Use the new install prefix above and omit `--download-model` to reuse the checkpoint files already on disk.
+When upgrading an existing clone, run `git fetch origin --tags` and `git switch --detach v1.2.0`. Use the new install prefix above and omit `--download-model` to reuse the checkpoint files already on disk.
 
 Use `bash scripts/install.sh --verify-only` to check package integrity without downloading or installing anything. Add `--venv "$HOME/.venvs/inkling-halo"` to check the wheel versions and ROCm extension. Add `--transformers-deps "$HOME/.local/share/inkling-halo/transformers-deps"` with that virtual environment to verify the isolated dependencies.
 
 ## 3. Serve
 
-Start one 4,096-token stream with DSpark and native tool calling. Fitted weights are enabled automatically when the model directory includes them.
+Start a single stream with DSpark and native tool calling. The launcher defaults to 1,048,576 tokens and reserves 52 GiB for the BF16 KV cache. Fitted weights are enabled automatically when the model directory includes them.
 
 ```bash
 "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --tools
@@ -74,9 +74,15 @@ python3 scripts/smoke-test.py --check-tools
 
 The API base URL is `http://127.0.0.1:18753/v1` and the model ID is `main`. The first launch builds a local Triton kernel cache and may take longer. Use `--dry-run` to preview the selected launch settings.
 
+Set `--context` to override the request limit. The launcher sizes the KV pool from that limit unless you set `--kv-mib` explicitly. Choose a smaller context and cache budget on systems with less available memory.
+
+```bash
+"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --context 32768 --kv-mib 24576 --tools
+```
+
 ### Serve images
 
-Start the vision preset. It uses a 32,768-token context, up to eight active sequences, and a shared 24 GiB BF16 KV cache. The original checkpoint contains the vision encoder weights.
+Start the vision preset. It also defaults to 1,048,576 tokens, including image tokens. It accepts up to eight active sequences sharing one 52 GiB BF16 KV cache. The original checkpoint contains the vision encoder weights.
 
 ```bash
 "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode vision
@@ -123,17 +129,17 @@ PYTHON
 ### Serve a 64K prompt
 
 ```bash
-"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode long-context --tools
+"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode long-context --context 66048 --tools
 ```
 
-This preset allows 66,048 total tokens for the prompt and completion, with a 28 GiB BF16 KV pool. It uses both sets of fitted weights.
+This example matches the 64K benchmark with 66,048 total tokens and a 28 GiB BF16 KV pool. It uses both sets of fitted weights.
 
 ### Serve eight requests
 
 ```bash
-"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode concurrent --tools
+"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --mode concurrent --context 4096 --tools
 ```
 
-This preset uses eight sequences at a 4,096-token request limit with a shared 6 GiB BF16 KV pool. It uses the fitted routed experts, matching the measured concurrent run.
+This example matches the measured eight-request run with a 4,096-token request limit, a shared 6 GiB BF16 KV pool, and the fitted routed experts.
 
 Pass `--original-weights` to use the original checkpoint files with the AMD runtime. The published highlights using fitted weights assume the default behavior.

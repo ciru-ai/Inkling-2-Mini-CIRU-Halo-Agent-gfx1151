@@ -16,7 +16,7 @@ tags:
 
 # Inkling 2 Mini · CIRU Halo Agent (gfx1151)
 
-Run Thinking Machines Lab's Inkling 2 Mini locally on **AMD Ryzen AI Max+ 395 with Radeon 8060S**. CIRU's ROCm vLLM build reached **1,691.3 prompt tokens/s**, **74.13 decode tokens/s across three single-request workloads**, and **88.92 aggregate output tokens/s across eight concurrent requests**. At a 65,536-token prompt, it reached **54.08 decode tokens/s**. The OpenAI-compatible API accepts text and images, streams reasoning, and supports native tool calling.
+Run Thinking Machines Lab's Inkling 2 Mini locally on **AMD Ryzen AI Max+ 395 with Radeon 8060S**. CIRU's ROCm vLLM build reached **1,691.3 prompt tokens/s**, **74.13 decode tokens/s across three single-request workloads**, and **88.92 aggregate output tokens/s across eight concurrent requests**. At a 65,536-token prompt, it reached **54.08 decode tokens/s**. The OpenAI-compatible API accepts text and images, streams reasoning, and supports native tool calling. The launcher defaults to a **1,048,576-token context** on the 128 GB Strix Halo configuration.
 
 ![Inkling 2 Mini CIRU Halo Agent benchmark on AMD Ryzen AI Strix Halo](assets/inklingamd.png)
 
@@ -64,7 +64,7 @@ The Hugging Face repository contains the original model and DSpark draft checkpo
 hf download jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151 --local-dir ./weights
 ```
 
-The standard single-request preset uses a 4,096-token context. The long-context benchmark used a 66,048-token window to fit a 65,536-token prompt with room to generate. Context limits include input and output. The vision preset allows 32,768 total tokens, including the image tokens.
+Use `--context` to set a different request limit and `--kv-mib` to set the cache budget. Context covers prompt, image, and generated tokens together. Active requests share one KV cache. The text benchmark table measures prompts through 65,536 tokens.
 
 ## Credits and license
 
