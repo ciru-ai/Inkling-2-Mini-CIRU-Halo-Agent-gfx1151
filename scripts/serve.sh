@@ -359,9 +359,9 @@ settings=(
     INKLING_AMD_TURBO_MARKOV_TOPK=0
     "INKLING_AMD_DSPARK_DRAFT_GRAPH=$draft_graph"
 )
-bundled_hip_so="$SCRIPT_DIR/rocm/hip_moe_prefill_gfx1151_80df0ef12be2.so"
-if [[ -z "${INKLING_AMD_HIP_PREFILL_SO:-}" && -f "$bundled_hip_so" ]]; then
-    settings+=("INKLING_AMD_HIP_PREFILL_SO=$bundled_hip_so")
+bundled_hip_so="$SCRIPT_DIR/rocm/hip_inkling_gfx1151_671b45b80972.so"
+if [[ -z "${INKLING_AMD_HIP_SO:-}" && -z "${INKLING_AMD_HIP_PREFILL_SO:-}" && -f "$bundled_hip_so" ]]; then
+    settings+=("INKLING_AMD_HIP_SO=$bundled_hip_so")
 fi
 if [[ -n "$joined_pypath" ]]; then
     settings=("PYTHONPATH=$joined_pypath" "${settings[@]}")
@@ -424,8 +424,15 @@ fi
 if (( tools )); then
     command+=(--enable-auto-tool-choice --tool-call-parser inkling)
 fi
+# Host selector supplies the native Inkling reasoning default.
+if [[ -n "${INKLING_PROFILER_CONFIG:-}" ]]; then
+    command+=(--profiler-config "$INKLING_PROFILER_CONFIG")
+fi
+if [[ -n "${INKLING_CHAT_TEMPLATE_KWARGS:-}" ]]; then
+    command+=(--default-chat-template-kwargs "$INKLING_CHAT_TEMPLATE_KWARGS")
+fi
 if (( dry_run )); then
-    printf 'Inkling 2 Mini CIRU Halo Agent v1.4.0 (%s, adaptive=%s, vision=%s, prefix_cache=%s)\n' \
+    printf 'Inkling 2 Mini CIRU Halo Agent v1.5.0 (%s, adaptive=%s, vision=%s, prefix_cache=%s)\n' \
         "$mode" "$adaptive_spec" "$vision" "$prefix_cache"
     printf 'Environment:\n'
     printf '  %q\n' "${settings[@]}"
@@ -455,6 +462,6 @@ ciru_use_fixed_rocr "$python_bin" || die 'ROCm idle CPU fix could not be loaded'
 for s in "${settings[@]}"; do
     export "$s"
 done
-printf 'Starting Inkling 2 Mini CIRU Halo Agent v1.4.0, mode=%s context=%s sequences=%s KV memory=%s MiB adaptive=%s vision=%s\n' \
+printf 'Starting Inkling 2 Mini CIRU Halo Agent v1.5.0, mode=%s context=%s sequences=%s KV memory=%s MiB adaptive=%s vision=%s\n' \
     "$mode" "$context" "$seqs" "$kv_mib" "$adaptive_spec" "$vision"
 exec "${command[@]}"
