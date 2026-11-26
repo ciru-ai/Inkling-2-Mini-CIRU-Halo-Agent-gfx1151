@@ -603,37 +603,18 @@ void hip_router_gemm_m8_kernel(
     const uint32_t* wr = W2 + (int64_t)e * 1152;
     const bool use_u4 = ((((uintptr_t)wr | (uintptr_t)X2) & 15u) == 0u);
 
-    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    if (use_u4) {
-        const uint4* w4 = reinterpret_cast<const uint4*>(wr);
-        const uint4* x4 = reinterpret_cast<const uint4*>(X2);
-        if (M == 8) {
-            for (int p = tid; p < 288; p += 128) {
-                uint4 wv = w4[p];
-                #pragma unroll
-                for (int r = 0; r < 8; ++r) {
-                    uint4 xv = x4[(int64_t)r * 288 + p];
-                    asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.x), "v"(xv.x));
-                    asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.y), "v"(xv.y));
-                    asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.z), "v"(xv.z));
-                    asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.w), "v"(xv.w));
-                }
-            }
-        } else if (M == 1) {
-            for (int p = tid; p < 288; p += 128) {
-                uint4 wv = w4[p];
-                uint4 xv = x4[p];
-                asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[0]) : "v"(wv.x), "v"(xv.x));
-                asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[0]) : "v"(wv.y), "v"(xv.y));
-                asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[0]) : "v"(wv.z), "v"(xv.z));
-                asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[0]) : "v"(wv.w), "v"(xv.w));
-            }
-        } else {
-            for (int p = tid; p < 288; p += 128) {
-                uint4 wv = w4[p];
-                #pragma unroll
-                for (int r = 0; r < 8; ++r) {
-                    if (r < M) {
+    __shared__ float sm[4][8];
+    for (int m0 = 0; m0 < M; m0 += 8) {
+        const int m_cnt = min(8, M - m0);
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        if (use_u4) {
+            const uint4* w4 = reinterpret_cast<const uint4*>(wr);
+            const uint4* x4 = reinterpret_cast<const uint4*>(X2 + (int64_t)m0 * 1152);
+            if (m_cnt == 8) {
+                for (int p = tid; p < 288; p += 128) {
+                    uint4 wv = w4[p];
+                    #pragma unroll
+                    for (int r = 0; r < 8; ++r) {
                         uint4 xv = x4[(int64_t)r * 288 + p];
                         asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.x), "v"(xv.x));
                         asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.y), "v"(xv.y));
@@ -641,40 +622,64 @@ void hip_router_gemm_m8_kernel(
                         asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.w), "v"(xv.w));
                     }
                 }
+            } else if (m_cnt == 1) {
+                for (int p = tid; p < 288; p += 128) {
+                    uint4 wv = w4[p];
+                    uint4 xv = x4[p];
+                    asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[0]) : "v"(wv.x), "v"(xv.x));
+                    asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[0]) : "v"(wv.y), "v"(xv.y));
+                    asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[0]) : "v"(wv.z), "v"(xv.z));
+                    asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[0]) : "v"(wv.w), "v"(xv.w));
+                }
+            } else {
+                for (int p = tid; p < 288; p += 128) {
+                    uint4 wv = w4[p];
+                    #pragma unroll
+                    for (int r = 0; r < 8; ++r) {
+                        if (r < m_cnt) {
+                            uint4 xv = x4[(int64_t)r * 288 + p];
+                            asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.x), "v"(xv.x));
+                            asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.y), "v"(xv.y));
+                            asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.z), "v"(xv.z));
+                            asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv.w), "v"(xv.w));
+                        }
+                    }
+                }
             }
-        }
-    } else {
-        for (int p = tid; p < 1152; p += 128) {
-            uint32_t wv = wr[p];
-            #pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                if (r < M) {
-                    uint32_t xv = X2[(int64_t)r * 1152 + p];
-                    asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv), "v"(xv));
+        } else {
+            const uint32_t* xr = X2 + (int64_t)m0 * 1152;
+            for (int p = tid; p < 1152; p += 128) {
+                uint32_t wv = wr[p];
+                #pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    if (r < m_cnt) {
+                        uint32_t xv = xr[(int64_t)r * 1152 + p];
+                        asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[r]) : "v"(wv), "v"(xv));
+                    }
                 }
             }
         }
-    }
-    __shared__ float sm[4][8];
-    #pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        if (r < M) {
-            float v = acc[r];
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
-            if (lane == 0) sm[warp][r] = v;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (r < m_cnt) {
+                float v = acc[r];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
+                if (lane == 0) sm[warp][r] = v;
+            }
         }
-    }
-    __syncthreads();
-    if (tid < M) {
-        float tot = sm[0][tid] + sm[1][tid] + sm[2][tid] + sm[3][tid];
-        if constexpr (FUSED_SIGMOID_BIAS) {
-            float sc = 1.0f / (1.0f + expf(-tot));
-            Out[tid * 128 + e] = sc;
-            Corrected[tid * 128 + e] = sc + Bias[e];
-        } else {
-            Out[tid * 128 + e] = tot;
+        __syncthreads();
+        if (tid < m_cnt) {
+            float tot = sm[0][tid] + sm[1][tid] + sm[2][tid] + sm[3][tid];
+            if constexpr (FUSED_SIGMOID_BIAS) {
+                float sc = 1.0f / (1.0f + expf(-tot));
+                Out[(m0 + tid) * 128 + e] = sc;
+                Corrected[(m0 + tid) * 128 + e] = sc + Bias[e];
+            } else {
+                Out[(m0 + tid) * 128 + e] = tot;
+            }
         }
+        if (m0 + 8 < M) __syncthreads();
     }
 }
 
@@ -700,7 +705,8 @@ void hip_route_m8_kernel(
     int M, float scale
 ) {
     const int tid  = (int)threadIdx.x;
-    const int row  = tid >> 5;   // 0..7 (1 warp per token row!)
+    const int local_row = tid >> 5;   // 0..7 (1 warp per token row!)
+    const int row  = (int)blockIdx.x * 8 + local_row;
     const int lane = tid & 31;
 
     __shared__ float    s_src[8][128];
@@ -722,7 +728,7 @@ void hip_route_m8_kernel(
             if constexpr (DO_SIGMOID) {
                 src = 1.0f / (1.0f + expf(-src));
             }
-            s_src[row][e] = src;
+            s_src[local_row][e] = src;
             float corr = BIAS_IS_CORR ? Bias[e] : (src + Bias[e]);
             keys[j] = ieee_desc_stable_key(corr, e);
         }
@@ -758,7 +764,7 @@ void hip_route_m8_kernel(
             }
             if (lane == 0) {
                 top_e[k] = win_e;
-                top_s[k] = s_src[row][win_e];
+                top_s[k] = s_src[local_row][win_e];
             }
         }
 
@@ -769,7 +775,7 @@ void hip_route_m8_kernel(
             for (int k = 0; k < 8; ++k) {
                 Ids[row * 8 + k] = (int64_t)top_e[k];
                 Gamma[row * 8 + k] = (top_s[k] / denom) * scale;
-                s_ids[row * 8 + k] = top_e[k];
+                if constexpr (DO_ALIGN) s_ids[local_row * 8 + k] = top_e[k];
             }
         }
     }
@@ -1298,7 +1304,7 @@ int launch_hip_router_gemm_m8(
     const void* X, const void* W, const void* Bias, void* Out, void* Corrected,
     int M, int fused_sigmoid_bias, void* stream_ptr
 ) {
-    if (M <= 0 || M > 8) return -1;
+    if (M <= 0 || M > 64) return -1;
     if (fused_sigmoid_bias) {
         hipLaunchKernelGGL((hip_router_gemm_m8_kernel<true>), dim3(128), dim3(128), 0, (hipStream_t)stream_ptr,
             (const uint32_t*)X, (const uint32_t*)W, (const float*)Bias, (float*)Out, (float*)Corrected, M);
@@ -1314,8 +1320,9 @@ int launch_hip_route_m8(
     void* Sorted, void* Experts, void* Padded,
     int M, int do_align, int do_sigmoid, int bias_is_corrected, float scale, void* stream_ptr
 ) {
-    if (M <= 0 || M > 8) return -1;
+    if (M <= 0 || M > (do_align || bias_is_corrected ? 8 : 64)) return -1;
     hipStream_t s = (hipStream_t)stream_ptr;
+    const int n_blocks = (M + 7) >> 3;
     if (bias_is_corrected) {
         hipLaunchKernelGGL((hip_route_m8_kernel<false, false, true>), dim3(1), dim3(256), 0, s,
             (const float*)Score, (const float*)Bias, (int64_t*)Ids, (float*)Gamma, nullptr, nullptr, nullptr, M, scale);
@@ -1323,8 +1330,8 @@ int launch_hip_route_m8(
         if (do_sigmoid) hipLaunchKernelGGL((hip_route_m8_kernel<true, true, false>),  dim3(1), dim3(256), 0, s, (const float*)Score, (const float*)Bias, (int64_t*)Ids, (float*)Gamma, (int32_t*)Sorted, (int32_t*)Experts, (int32_t*)Padded, M, scale);
         else            hipLaunchKernelGGL((hip_route_m8_kernel<true, false, false>), dim3(1), dim3(256), 0, s, (const float*)Score, (const float*)Bias, (int64_t*)Ids, (float*)Gamma, (int32_t*)Sorted, (int32_t*)Experts, (int32_t*)Padded, M, scale);
     } else {
-        if (do_sigmoid) hipLaunchKernelGGL((hip_route_m8_kernel<false, true, false>),  dim3(1), dim3(256), 0, s, (const float*)Score, (const float*)Bias, (int64_t*)Ids, (float*)Gamma, nullptr, nullptr, nullptr, M, scale);
-        else            hipLaunchKernelGGL((hip_route_m8_kernel<false, false, false>), dim3(1), dim3(256), 0, s, (const float*)Score, (const float*)Bias, (int64_t*)Ids, (float*)Gamma, nullptr, nullptr, nullptr, M, scale);
+        if (do_sigmoid) hipLaunchKernelGGL((hip_route_m8_kernel<false, true, false>),  dim3(n_blocks), dim3(256), 0, s, (const float*)Score, (const float*)Bias, (int64_t*)Ids, (float*)Gamma, nullptr, nullptr, nullptr, M, scale);
+        else            hipLaunchKernelGGL((hip_route_m8_kernel<false, false, false>), dim3(n_blocks), dim3(256), 0, s, (const float*)Score, (const float*)Bias, (int64_t*)Ids, (float*)Gamma, nullptr, nullptr, nullptr, M, scale);
     }
     return 0;
 }

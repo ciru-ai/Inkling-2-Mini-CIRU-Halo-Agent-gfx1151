@@ -730,7 +730,7 @@ class Inkling2LoopForConditionalGeneration(
             target_graph = (
                 os.getenv("INKLING_AMD_DSPARK_TARGET_GRAPH") == "1"
                 and spec is not None
-                and spec.method == "dspark"
+                and spec.method in ("dspark", "dflash")
                 and 1 <= spec.num_speculative_tokens <= 7
                 and spec.draft_sample_method in ("greedy", "probabilistic")
                 and parallel.data_parallel_size == 1
@@ -742,12 +742,18 @@ class Inkling2LoopForConditionalGeneration(
                     "The ROCm Mini graph path requires 1..8 sequences with plain "
                     "decode or DSpark speculation"
                 )
-        if spec is not None and (
-            spec.method != "dspark"
-            or spec.draft_model_config.architectures != ["Inkling2DSparkModel"]
+        if spec is not None and not (
+            (
+                spec.method == "dspark"
+                and spec.draft_model_config.architectures == ["Inkling2DSparkModel"]
+            )
+            or (
+                spec.method == "dflash"
+                and spec.draft_model_config.architectures == ["DFlash2DraftModel"]
+            )
         ):
             raise ValueError(
-                "The ROCm Mini reference only supports the native Inkling DSpark draft"
+                "The ROCm Mini reference only supports Inkling DSpark or DFlash2 drafts"
             )
         if model_config.enable_prompt_embeds:
             raise ValueError("The ROCm Mini reference expects token IDs")
@@ -857,7 +863,12 @@ class Inkling2LoopForConditionalGeneration(
         return self
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = tuple(layers)
+        ids = tuple(layers)
+        if ids and ids[-1] == self.text_config.num_layer_visits + 1:
+            # vLLM DFlash adds +1 to dflash_config.target_layer_ids; Inkling
+            # captures native 0-based visit indices ending at num_layer_visits.
+            ids = tuple(i - 1 for i in ids)
+        self.model.aux_hidden_state_layers = ids
 
     def forward(
         self,

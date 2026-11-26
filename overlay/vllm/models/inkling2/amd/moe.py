@@ -72,7 +72,8 @@ class Inkling2Gate(nn.Module):
             os.getenv("INKLING_AMD_TURBO_ROUTER_M8") == "1"
             and x.is_cuda
             and x.dtype == torch.bfloat16
-            and x.shape == (8, 2304)
+            and 1 <= x.shape[0] <= 64
+            and x.shape[1] == 2304
             and self.weight.shape == (128, 2304)
         ):
             from .ops.turbo_kernels import router_gemm_m8_fp32
@@ -88,12 +89,29 @@ class Inkling2Gate(nn.Module):
 
             scores = router_scores_m1(x, self.weight, self.bias)
         elif (
-            x.shape[0] >= 64
+            x.shape[0] > 64
             and os.getenv("INKLING_AMD_TURBO_PREFILL_MOE", "0") not in ("", "0")
         ):
             from .ops.turbo_kernels import router_scores_prefill
 
             scores = router_scores_prefill(x, self.weight, self.bias)
+        if (
+            scores is None
+            and os.getenv("INKLING_AMD_TURBO_ROUTER_M8") == "1"
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and 1 < x.shape[0] <= 64
+            and x.shape[1] == 2304
+            and self.weight.shape == (128, 2304)
+            and self.topk == 8
+        ):
+            from .ops.hip_runtime import hip_route_m8, hip_router_gemm_m8
+
+            logits = hip_router_gemm_m8(x, self.weight)
+            if logits is not None:
+                routed = hip_route_m8(logits, self.bias, self.route_scale, mode="tail")
+                if routed is not None:
+                    return routed[0], routed[1]
         if scores is None:
             score = self.fp32_logits(x).sigmoid()
             corrected = score + self.bias

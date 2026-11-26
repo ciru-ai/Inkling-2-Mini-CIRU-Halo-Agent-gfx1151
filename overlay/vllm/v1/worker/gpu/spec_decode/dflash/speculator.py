@@ -631,8 +631,30 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         if num_speculative_tokens == 0:
-            # No drafts are needed: store the context K/V to keep the drafter in
-            # sync, and skip the query pass.
+            # No drafts are needed: store only in-window context K/V (skipping
+            # PAD_SLOT_ID out-of-window prefill chunks from DFlashSlidingWindowManager).
+            if (
+                not dummy_run
+                and num_target_tokens > 64
+                and len(self.draft_kv_cache_group_ids) == 1
+            ):
+                slots0 = self._context_slot_mappings[0][:num_target_tokens]
+                valid_idx = torch.nonzero(slots0 != PAD_SLOT_ID, as_tuple=False).flatten()
+                n_valid = int(valid_idx.numel())
+                if n_valid == 0:
+                    return self.draft_tokens[:num_reqs]
+                if n_valid < num_target_tokens:
+                    first_valid = int(valid_idx[0].item())
+                    # Slice contiguous tail [first_valid:num_target_tokens]
+                    tail_len = num_target_tokens - first_valid
+                    if aux_hidden_states is not None:
+                        tail_aux = [h[first_valid:num_target_tokens] for h in aux_hidden_states]
+                        combined = self.model.combine_hidden_states(torch.cat(tail_aux, dim=-1))
+                    else:
+                        combined = last_hidden_states[first_valid:num_target_tokens]
+                    self.hidden_states[first_valid:num_target_tokens].copy_(combined)
+                    self._precompute_context_kv(first_valid, num_target_tokens, dummy_run)
+                    return self.draft_tokens[:num_reqs]
             self._store_hidden_states(
                 num_target_tokens, last_hidden_states, aux_hidden_states
             )

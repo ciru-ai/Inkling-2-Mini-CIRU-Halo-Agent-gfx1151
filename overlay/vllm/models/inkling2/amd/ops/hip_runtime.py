@@ -1290,7 +1290,7 @@ def hip_sconv_prefill(
         return None
     num_tokens, channels = x.shape
     if (
-        num_tokens < 64
+        num_tokens <= 64
         or weight.ndim != 2
         or weight.shape != (channels, 4)
         or channels != cache.shape[1] * stream_width
@@ -1399,7 +1399,7 @@ def hip_loop_zeromat_prefill(
         return None
     streams, t_len, width = dest.shape
     if (
-        t_len < 64
+        t_len <= 64
         or width != 2304
         or streams not in (1, 3)
         or bank0.shape != (t_len, width)
@@ -1558,7 +1558,7 @@ def hip_router_prefill(
     if (
         not x.is_cuda
         or x.ndim != 2
-        or x.shape[0] < 64
+        or x.shape[0] <= 64
         or x.shape[1] != 2304
         or weight.shape != (128, 2304)
         or bias.shape != (128,)
@@ -2761,7 +2761,7 @@ def hip_sconv_decode(
     num_tokens, channels = x.shape
     if (
         num_tokens <= 0
-        or num_tokens >= 64
+        or num_tokens > 64
         or weight.device != x.device
         or cache.device != x.device
         or positions.device != x.device
@@ -3105,7 +3105,7 @@ def hip_router_gemm_m8(
         or not x.is_cuda
         or x.ndim != 2
         or x.shape[0] <= 0
-        or x.shape[0] > 8
+        or x.shape[0] > 64
         or x.shape[1] != 2304
         or w_bf16.device != x.device
         or w_bf16.shape != (128, 2304)
@@ -3158,7 +3158,7 @@ def hip_route_m8(
         or bias.device != logits.device
         or logits.ndim != 2
         or logits.shape[0] <= 0
-        or logits.shape[0] > 8
+        or logits.shape[0] > (64 if mode == "tail" else 8)
         or logits.shape[1] != 128
         or bias.shape != (128,)
         or logits.dtype != torch.float32

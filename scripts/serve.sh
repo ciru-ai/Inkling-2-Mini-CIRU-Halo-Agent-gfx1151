@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Portable launcher for Inkling 2 Mini CIRU Halo Agent (gfx1151) v1.4.0.
+# Portable launcher for Inkling 2 Mini CIRU Halo Agent (gfx1151) v1.6.0.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -32,7 +32,9 @@ Modes & Serving Options:
   --spec-tokens K         Fixed DSpark draft depth 1..7 (overrides mode default)
   --adaptive-spec         Enable dual-depth adaptive DSpark HIP graphs (K=7 @ B=1, K=4 @ B=2..N; default in vision/concurrent)
   --no-adaptive-spec      Disable adaptive depth switching
-  --no-spec               Disable DSpark speculative decoding
+  --dflash2 PATH          Use Inco AI DFlash 2 drafter (e.g. incoai/Inkling-2-Mini-DFlash2)
+                          with native W6 WMMA backbone, TRITON_ATTN 3D split-KV, and probabilistic drafting
+  --no-spec               Disable speculative decoding
   --prefix-cache          Enable vLLM prefix caching (default: on in vision mode)
   --no-prefix-cache       Disable vLLM prefix caching
   --tools                 Enable Inkling native auto tool calling
@@ -74,6 +76,7 @@ spec_tokens=
 spec_tokens_set=0
 adaptive_spec=0
 speculation=1
+dflash2_model="${INKLING_DFLASH2_MODEL:-}"
 prefix_cache=auto
 tools=0
 vision=auto
@@ -93,7 +96,7 @@ dry_run=0
 
 while (( $# )); do
     case "$1" in
-        --model|--mode|--served-model-name|--host|--port|--context|--seqs|--batch-tokens|--prefill-chunk-tokens|--kv-mib|--spec-tokens|--python|--overlay|--transformers-src|--transformers-deps|--triton-cache)
+        --model|--mode|--served-model-name|--host|--port|--context|--seqs|--batch-tokens|--prefill-chunk-tokens|--kv-mib|--spec-tokens|--dflash2|--python|--overlay|--transformers-src|--transformers-deps|--triton-cache)
             (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || die "missing value for $1"
             ;;
     esac
@@ -112,6 +115,7 @@ while (( $# )); do
         --spec-tokens) spec_tokens="$2"; spec_tokens_set=1; shift ;;
         --adaptive-spec) adaptive_spec=1 ;;
         --no-adaptive-spec) adaptive_spec=-1 ;;
+        --dflash2) dflash2_model="$2"; shift ;;
         --no-spec) speculation=0 ;;
         --prefix-cache) prefix_cache=1 ;;
         --no-prefix-cache) prefix_cache=0 ;;
@@ -359,7 +363,14 @@ settings=(
     INKLING_AMD_TURBO_MARKOV_TOPK=0
     "INKLING_AMD_DSPARK_DRAFT_GRAPH=$draft_graph"
 )
-bundled_hip_so="$SCRIPT_DIR/rocm/hip_inkling_gfx1151_671b45b80972.so"
+if [[ -n "$dflash2_model" ]]; then
+    settings+=(
+        "INKLING_AMD_DFLASH2_W6=${INKLING_AMD_DFLASH2_W6:-1}"
+        "INKLING_AMD_DFLASH2_W6_FC=${INKLING_AMD_DFLASH2_W6_FC:-0}"
+        "INKLING_AMD_DFLASH2_W6_HEAD=${INKLING_AMD_DFLASH2_W6_HEAD:-1}"
+    )
+fi
+bundled_hip_so="$SCRIPT_DIR/rocm/hip_inkling_gfx1151_07458d24acf9.so"
 if [[ -z "${INKLING_AMD_HIP_SO:-}" && -z "${INKLING_AMD_HIP_PREFILL_SO:-}" && -f "$bundled_hip_so" ]]; then
     settings+=("INKLING_AMD_HIP_SO=$bundled_hip_so")
 fi
@@ -388,7 +399,10 @@ else
     command+=(--disable-prefix-caching)
 fi
 cg_req_sizes=$(seq -s, 1 "$seqs")
-if (( adaptive_spec > 0 && seqs > 1 )); then
+if [[ -n "$dflash2_model" ]]; then
+    if (( ! spec_tokens_set )); then spec_tokens=7; fi
+    cg_max_toks=$((seqs * (spec_tokens + 1)))
+elif (( adaptive_spec > 0 && seqs > 1 )); then
     cg_max_toks=$((seqs * 5 > 8 ? seqs * 5 : 8))
 else
     cg_max_toks=$((seqs * (spec_tokens + 1)))
@@ -409,7 +423,13 @@ else
     command+=(--enforce-eager)
 fi
 if (( speculation )); then
-    if (( adaptive_spec > 0 && seqs > 1 )); then
+    if [[ -n "$dflash2_model" ]]; then
+        dflash2_sample="${INKLING_DFLASH2_SAMPLE_METHOD:-probabilistic}"
+        command+=(
+            --speculative-config
+            "{\"method\":\"dflash\",\"model\":\"$dflash2_model\",\"num_speculative_tokens\":$spec_tokens,\"draft_sample_method\":\"$dflash2_sample\",\"attention_backend\":\"TRITON_ATTN\"}"
+        )
+    elif (( adaptive_spec > 0 && seqs > 1 )); then
         command+=(
             --speculative-config
             "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"num_speculative_tokens_per_batch_size\":[[1,1,7],[2,$seqs,4]],\"draft_sample_method\":\"$sample_method\"}"
@@ -432,7 +452,7 @@ if [[ -n "${INKLING_CHAT_TEMPLATE_KWARGS:-}" ]]; then
     command+=(--default-chat-template-kwargs "$INKLING_CHAT_TEMPLATE_KWARGS")
 fi
 if (( dry_run )); then
-    printf 'Inkling 2 Mini CIRU Halo Agent v1.5.0 (%s, adaptive=%s, vision=%s, prefix_cache=%s)\n' \
+    printf 'Inkling 2 Mini CIRU Halo Agent v1.6.0 (%s, adaptive=%s, vision=%s, prefix_cache=%s)\n' \
         "$mode" "$adaptive_spec" "$vision" "$prefix_cache"
     printf 'Environment:\n'
     printf '  %q\n' "${settings[@]}"
@@ -451,7 +471,11 @@ fi
     die 'Pinned Transformers dependencies missing; follow INSTALL.md'
 [[ -s "$model/config.json" && -s "$model/model-00001-of-00001.safetensors" ]] || die 'Checkpoint files missing from the model directory'
 if (( speculation )); then
-    [[ -s "$model/mtp.safetensors" ]] || die 'Bundled DSpark weights are missing from the model directory'
+    if [[ -n "$dflash2_model" ]]; then
+        [[ -s "$dflash2_model/model.safetensors" && -s "$dflash2_model/config.json" ]] || die "DFlash 2 draft files missing from: $dflash2_model"
+    else
+        [[ -s "$model/mtp.safetensors" ]] || die 'Bundled DSpark weights are missing from the model directory'
+    fi
 fi
 [[ -r /dev/kfd && -w /dev/kfd ]] || die '/dev/kfd is not readable/writable; check render/video/kfd group permissions'
 mkdir -p "$triton_cache"
@@ -462,6 +486,6 @@ ciru_use_fixed_rocr "$python_bin" || die 'ROCm idle CPU fix could not be loaded'
 for s in "${settings[@]}"; do
     export "$s"
 done
-printf 'Starting Inkling 2 Mini CIRU Halo Agent v1.5.0, mode=%s context=%s sequences=%s KV memory=%s MiB adaptive=%s vision=%s\n' \
+printf 'Starting Inkling 2 Mini CIRU Halo Agent v1.6.0, mode=%s context=%s sequences=%s KV memory=%s MiB adaptive=%s vision=%s\n' \
     "$mode" "$context" "$seqs" "$kv_mib" "$adaptive_spec" "$vision"
 exec "${command[@]}"

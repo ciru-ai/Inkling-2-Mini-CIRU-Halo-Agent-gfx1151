@@ -42,7 +42,7 @@ The last command should display a HIP version and an architecture beginning with
 ```bash
 git clone https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151.git
 cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
-INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.5.0"
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.6.0"
 INKLING_MODEL="$HOME/models/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151"
 
 bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
@@ -50,19 +50,19 @@ bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
   --prefix "$INKLING_ROOT" --download-model "$INKLING_MODEL"
 ```
 
-The installer verifies the package and model checksums, retrieves the pinned [vLLM runtime](https://github.com/ciru-ai/vllm/commit/b1dcc9e6f4b1fadc3a6a21c96b8e449de81238d6) and [Transformers support](https://github.com/huggingface/transformers/commit/6173a2f679ff4ed393afc499aefc569da7e68bc1), installs the bundled portable `gfx1151` ABI v3 all-HIP prefill & decode library (`scripts/rocm/hip_inkling_gfx1151_671b45b80972.so`, requiring no `hipcc` or `rocm-sdk-devel`), and links the ROCm extensions into the standalone prefix. The launcher reuses the virtual environment. If you already have the complete [Hugging Face bundle](https://huggingface.co/jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151), omit `--download-model` and point the launcher at your copy.
+The installer verifies the package and model checksums, retrieves the pinned [vLLM runtime](https://github.com/ciru-ai/vllm/commit/b1dcc9e6f4b1fadc3a6a21c96b8e449de81238d6) and [Transformers support](https://github.com/huggingface/transformers/commit/6173a2f679ff4ed393afc499aefc569da7e68bc1), installs the bundled portable `gfx1151` ABI v3 all-HIP prefill & decode library (`scripts/rocm/hip_inkling_gfx1151_07458d24acf9.so`, requiring no `hipcc` or `rocm-sdk-devel`), and links the ROCm extensions into the standalone prefix. The launcher reuses the virtual environment. If you already have the complete [Hugging Face bundle](https://huggingface.co/jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151), omit `--download-model` and point the launcher at your copy.
 
 You can also run `bash scripts/install.sh` from the root of the complete Hugging Face download.
 
-### Upgrading from v1.2.x, v1.3.x, or v1.4.0 to v1.5.0
+### Upgrading from v1.2.x, v1.3.x, or v1.4.0 to v1.6.0
 
 Your existing model and fitted weight files (`WEIGHTS.sha256`) are unchanged and do not need to be re-downloaded. Update the runtime repo, install into the new prefix, and restart the server:
 
 ```bash
 cd Inkling-2-Mini-CIRU-Halo-Agent-gfx1151
 git fetch origin --tags
-git switch --detach v1.5.0
-INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.5.0"
+git switch --detach v1.6.0
+INKLING_ROOT="$HOME/.local/opt/inkling-halo-v1.6.0"
 
 bash scripts/install.sh --venv "$HOME/.venvs/inkling-halo" \
   --transformers-deps "$HOME/.local/share/inkling-halo/transformers-deps" \

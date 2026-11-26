@@ -16,7 +16,7 @@ tags:
 
 # Inkling 2 Mini · CIRU Halo Agent (gfx1151)
 
-Run Thinking Machines Lab's Inkling 2 Mini locally on **AMD Ryzen AI Max+ 395 with Radeon 8060S (`gfx1151`)**. With **v1.5.0**, the default `./serve.sh` launch runs a **complete native RDNA 3.5 HIP prefill and decode engine** out of the box—no `hipcc`, no hidden flags, and no vision speed penalty: **2,299.4 client / 2,421.9 server prompt tokens/s** at 4K (**+56% over v1.3.1**, **2,309.1 / 2,368.0 tok/s at 8K**, **2,100.8 / 2,117.8 tok/s at 32K**, **1,904.3 / 1,915.5 tok/s at 58K**, all with zero prefix-cache hits), **50.2 server / 46.8 client decode tokens/s at 128K context** (**+41.1% server / +38.6% client** with 100% exact 128K needle retrieval and `1M`-ready `int64_t` paged KV addressing), **194–208 tok/s** on heavy 8-stream decode (**+13–19% faster**, **246–296 tok/s** on `B=8` exact JSON), and **`65 s` fresh-cache cold startup** (**3.5× faster** than v1.4.0's `230 s+` cold boot). The OpenAI-compatible API accepts text and images, enables prefix caching, streams reasoning, supports native tool calling, defaults to a **1,048,576-token context** on 128 GB Strix Halo, and idles at **~0.5–1.4% of one CPU core**.
+Run Thinking Machines Lab's Inkling 2 Mini locally on **AMD Ryzen AI Max+ 395 with Radeon 8060S (`gfx1151`)**. With **v1.6.0**, this runtime adds native RDNA 3.5 **W6 WMMA DFlash 2** speculative decoding (`--dflash2`, accelerating [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) with `TRITON_ATTN` 3D split-KV sliding-window attention and lossless probabilistic drafting), pushing Strix Halo to **81.1 tok/s at B=1 `T=1.0`** (**+38.3% over v1.5.0**, **119.5 tok/s on math**), **79.7 tok/s at B=1 greedy** (**+32.6%**), **220–243 tok/s at B=8** (**+24.4% at `T=1.0`**), and **41.0 tok/s sustained 128K decode (`512t`, +10.4%)** with **1,499–1,511 tok/s 128K prefill** and **100% exact 128K needle retrieval**. Without `--dflash2`, the default `./serve.sh` launch continues to run the **complete native RDNA 3.5 HIP prefill and decode engine** with bundled adaptive DSpark out of the box—no `hipcc`, no hidden flags, and no vision speed penalty: **2,299.4 client / 2,421.9 server prompt tokens/s** at 4K (**+56% over v1.3.1**, **2,309.1 / 2,368.0 tok/s at 8K**, **2,100.8 / 2,117.8 tok/s at 32K**, **1,904.3 / 1,915.5 tok/s at 58K**, all with zero prefix-cache hits), **50.2 server / 46.8 client decode tokens/s at 128K context** (**+41.1% server / +38.6% client** with 100% exact 128K needle retrieval and `1M`-ready `int64_t` paged KV addressing), **194–208 tok/s** on heavy 8-stream decode (**+13–19% faster**, **246–296 tok/s** on `B=8` exact JSON), and **`65 s` fresh-cache cold startup** (**3.5× faster** than v1.4.0's `230 s+` cold boot). The OpenAI-compatible API accepts text and images, enables prefix caching, streams reasoning, supports native tool calling, defaults to a **1,048,576-token context** on 128 GB Strix Halo, and idles at **~0.5–1.4% of one CPU core**.
 
 ![Inkling 2 Mini CIRU Halo Agent benchmark on AMD Ryzen AI Strix Halo](assets/inklingamd.png)
 
@@ -26,6 +26,12 @@ Run Thinking Machines Lab's Inkling 2 Mini locally on **AMD Ryzen AI Max+ 395 wi
 
 ## Release notes
 
+### v1.6.0 — Native W6 WMMA DFlash 2 Speculative Decoding + `M <= 64` HIP Router (`81.1 tok/s` B=1 `T=1.0`, `119.5 tok/s` Math, `220–243 tok/s` B=8, `+10.4%` 128K Decode)
+- **First-class Inco AI DFlash 2 support (`--dflash2 PATH`):** Full mathematical parity with [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) in vLLM on RDNA 3.5: shared target `embed_norm`, native 0-based Inkling visit feature capture `(5, 23, 41, 48)`, `selector_softcap_mode="after_correction"` (`30.0 * tanh(scores / 30.0)`), unpadded vocabulary masking (`200,058`), lossless probabilistic candidate-path sampling (`draft_sample_method="probabilistic"`), and FULL Target + Draft HIP graph capture across `B=1..8`.
+- **Native RDNA 3.5 W6 WMMA acceleration for DFlash 2 (`qwen3_dflash2.py`):** Quantizes all 20 backbone linear layers (`740 MB → 278 MB` W6 WMMA with `splits=4` on `N=2304` at `M <= 16`) and reuses the target's already-packed `w6_wmma_head` (`926 MB → 347 MB`) for candidate top-16 projection, cutting total 5-layer DFlash 2 draft GPU time from `~14.3 ms` down to **`4.48 ms` at B=1** (`9.82 ms` at B=8) while keeping `fc` in BF16 for peak `T=1.0` acceptance (`~3.9–4.0` mean accepted tokens/step).
+- **128K long-context DFlash 2 attention & prefill fixes (`triton_unified_attention.py`, `triton_attention_helpers.py`, `dflash/speculator.py`):** Enables `TRITON_ATTN` **3D split-KV + `window_segments`** for non-causal sliding-window drafting (`sliding_window=2048`), eliminating `ROCM_ATTN`'s full-sequence scan (`11.9 → 46.9 tok/s` peak on 128K) and serial 2D execution, and skips out-of-window (`PAD_SLOT_ID`) prefill chunks in DFlash 2 context K/V precompute for zero prefill regression (`1,499–1,511 tok/s` 128K prefill).
+- **Fused `M = 1..64` HIP router & `M = 64` decode dispatch fix (`scripts/rocm/hip_inkling_gfx1151_07458d24acf9.so`, `hip_glue_decode.hip`, `hip_runtime.py`, `moe.py`, `rocm_attn.py`):** Generalized `hip_router_gemm_m8_kernel` (`v_dot2_f32_bf16`) and `hip_route_m8_kernel` (`mode="tail"`) to `M = 1..64` (bit-exact top-8 parity verified across `M = 1, 8, 16, 40, 64`), fixed `>= 64` → `> 64` prefill/decode dispatch thresholds so `B=8, K=7` (`M=64`) stays on native decode HIP kernels (`+14.2%` B=8 jump), and added in-place `update_draft_decode_metadata` to `RocmAttentionMetadataBuilder`. [v1.6.0 release](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151/releases/tag/v1.6.0)
+
 ### v1.5.0 — All-HIP RDNA 3.5 Prefill & Decode Engine (`+41%` 128K Decode, `2,422` Server PP @ 4K, `65s` Cold Startup)
 - **Unified portable ABI v3 native HIP library (`scripts/rocm/hip_inkling_gfx1151_671b45b80972.so`):** Compiles **299 native RDNA 3.5 (`gfx1151`) GPU kernels** across all 7 `.hip` translation units with **0 VGPR/SGPR/Scratch spills**, zero `RPATH`/`RUNPATH`, strictly `libamdhip64.so.7` + `libc.so.6` (`GLIBC_2.2.5`), verified by `MANIFEST.sha256`—requiring no `hipcc` or `rocm-sdk-devel`, with 7 independent per-unit kill switches and automatic fallback preserved.
 - **`1M`-ready native HIP decode attention (`hip_attn_decode.hip`):** Zero-materialization cooperative `BN=32` / `BQ_PACK=32` BF16-WMMA split-KV flash relative attention + `hip_kv_conv_decode` + `hip_decode_combine` covering both Target (`HAS_REL=True`, `HAS_TAU` post-8K) and Draft (`block_decode_attention`) layers with `int64_t` paged KV addressing up to `1,048,576` tokens—sustaining **`227.7 GB/s`** at `128K` global attention and delivering **`50.18` server / `46.79` client decode tok/s at `128K`** (**+41.1% server / +38.6% client**) with **100% exact `128K` Needle-in-a-Haystack retrieval** (`1,482.3 tok/s` prefill).
@@ -33,7 +39,7 @@ Run Thinking Machines Lab's Inkling 2 Mini locally on **AMD Ryzen AI Max+ 395 wi
 - **Single-pass-per-expert `M16`/`M32` native HIP decode MoE (`hip_moe_decode.hip`):** Greedy adjacent-block `M32` pairing planner (with capture-safe `w13 → w2` deduplication) + zero-`smem_B` software-pipelined WMMA kernels across all four expert banks (`source`, `mixed1`, `mixed2`, `coda`) plus `hip_moe_reduce` lowered to `M >= 1`—saturating `~220–225 GB/s` (`92–94%` of LPDDR5X peak) and driving **`+13.0%`** (`8×256t`, `194.1 tok/s`) and **`+17.4%–18.7%`** (`8×512t`, `205.5–207.8 tok/s`) live `B=8` throughput gains.
 - **Complete native HIP prefill & decode glue + DSpark (`hip_attn_prefill.hip`, `hip_glue_prefill.hip`, `hip_glue_decode.hip`):** Native HIP zero-mat BF16-WMMA prefill attention (`+29%` Unit B prefill), `hip_sconv_prefill`/`hip_sconv_decode` (1-channel/thread 21-VGPR `int32`/`int64`-position safe), 2-pass 1-read-per-weight `hip_loop_decode_blend_rms`, `uint4` `hip_loop_decode_down` & `hip_router_gemm_m8`, 256-thread parallel IEEE-754 bit-exact `hip_route_m8`, `hip_attn_res_prefill` (1-pass register cache up to `N<=12`, lowered to `M>=1`), and full DSpark draft kernels (`mix_rmsnorm`, `rms_norm`, `qk_norm_rope`, `dspark_w8`, `silu_and_mul`, `add_softcap`, `markov_gate`).
 - **3.5× faster fresh-cache cold startup:** Eliminates ported prefill and decode Triton/Gluon JIT compilation on the hot path, cutting empty-cache `serve.sh` cold startup to **`65 s`** (`31.3 s` vLLM engine init, **`1 s`** HIP graph capture, down from `230 s+` in v1.4.0).
-- **Full-vocabulary quality verified against v1.4.0:** `mean_forward_kl = 0.000192` and **`100.00%` top-1 agreement** (`162/162`) across aligned decode (including 64-step post-8K `tau != None` `9,600t` decode at `0.000043` KL), `0.000616` KL / `99.50%` top-1 on prefill (`200` positions). **Model and fitted weight files (`WEIGHTS.sha256`) are unchanged from v1.2.x–v1.4.0.** [v1.5.0 release](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151/releases/tag/v1.5.0)
+- **Full-vocabulary quality verified against v1.4.0:** `mean_forward_kl = 0.000192` and **`100.00%` top-1 agreement** (`162/162`) across aligned decode (including 64-step post-8K `tau != None` `9,600t` decode at `0.000043` KL), `0.000616` KL / `99.50%` top-1 on prefill (`200` positions). **Model and fitted weight files (`WEIGHTS.sha256`) are unchanged from v1.2.x–v1.4.0.** [v1.5.0 release](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151/releases/tag/v1.6.0)
 
 ### v1.4.0 — Native RDNA 3.5 HIP Prefill Kernels (2,230 Client / 2,363 Server tok/s at 4K, +52% Faster Prefill)
 - Added initial native `gfx1151` HIP paired-`M128`/`M64` MoE prefill (`hip_moe_prefill.hip`), 1-warp K/V short-conv, zero-mat loop blend, scalar-page `BLOCK_N=16` prefill attention, and fused BF16-WMMA prefill router. [v1.4.0 release](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151/releases/tag/v1.4.0)
@@ -56,6 +62,20 @@ Run Thinking Machines Lab's Inkling 2 Mini locally on **AMD Ryzen AI Max+ 395 wi
 ## Performance on AMD Ryzen AI Strix Halo (`gfx1151`)
 
 Measured live end-to-end on an AMD Ryzen AI Max+ 395 with Radeon 8060S graphics (`20 WGPs / 40 CUs`) and 128 GB unified LPDDR5X memory (NixOS, Python 3.12.12, PyTorch `2.13.0+rocm10.0.0`, Triton `3.8.0`, vLLM `0.34.0+rocm100`) running the **default full-featured Vision profile** (`--mode vision --tools --context 1048576 --kv-mib 53248 --batch-tokens 4096`, adaptive `K=7/K=4`, 9+9 FULL HIP graphs, prefix caching enabled, zero `hipcc` on `PATH`).
+
+### 0. v1.6.0 Paired Live Benchmarks: DFlash 2 (`--dflash2`) vs. v1.5.0 DSpark (Zero Regressions)
+
+Measured live end-to-end on the same `ciru` Strix Halo (`gfx1151`, 128 GB unified memory) host with 1M context, 8 concurrent slots, vision, tools, prefix caching, and FULL Target + Draft HIP graphs:
+
+| Workload | Live v1.5.0 DSpark (`K=7@B1 / K=4@B8`) | **v1.6.0 DFlash 2 W6 + 3D Split-KV (`--dflash2`)** | **Gain vs. v1.5.0** |
+|---|---:|---:|---:|
+| **B=1 `T=1.0` (official default, `3×512t`)** | `58.67 tok/s` (`acc 2.82`) | **`81.12 tok/s`** (`acc 4.01`, **math `119.52 tok/s`**) | **+38.3%** |
+| **B=1 Greedy (`T=0.0`, `3×512t`)** | `60.07 tok/s` (`acc 2.88`) | **`79.65 tok/s`** (`math 109.34`, `reason 81.88`, `code 61.32`) | **+32.6%** |
+| **B=8 `T=1.0` (official default, `8×512t`)** | `176.94 tok/s` (`acc 2.47`) | **`220.18 tok/s`** (`acc 3.85`) | **+24.4%** |
+| **B=8 Greedy (`T=0.0`, `8×512t`)** | `201.64 tok/s` (`acc 2.77`) | **`221.71–242.95 tok/s`** (`acc 3.97–4.39`) | **+10.0% to +20.5%** |
+| **128K Prefill (`pt=127,731`)** | `1,507.7 tok/s` | **`1,499.3–1,511.2 tok/s`** | **Parity / +0.2%** |
+| **128K Needle (`pt=127,731`)** | Exact (`100%`) | **Exact (`100%`)** | **Parity** |
+| **128K Sustained Decode (`512t`, `127,680` hits)** | `37.10 tok/s` (`13.80 s`) | **`40.96 tok/s`** (`12.50 s`, `acc 3.06`) | **+10.4%** |
 
 ### 1. Warm Zero-Cache Prompt Processing (`1K–58K`, Default Vision Profile, `Hits = 0`)
 
@@ -101,18 +121,22 @@ The same runtime serves the unmodified Thinking Machines Lab checkpoint mirrored
 
 Install or upgrade the ROCm vLLM runtime from the companion GitHub repository. The installation guide covers GPU access, pinned ROCm 10 wheels, the checked-in installer, upgrade steps from v1.2.x–v1.4.0, launch commands for every mode (`vision`, `concurrent`, `single`, `long-context`, `sampling`), and smoke-test verification. [GitHub runtime](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151) · [Installation guide](INSTALL.md) · [v1.5.0 release](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151/releases/tag/v1.5.0)
 
-This Hugging Face repository contains the unmodified upstream model and DSpark draft checkpoint, the separate CIRU fitted weight banks under `optimized-weights/`, and the full v1.5.0 runtime bundle (including the prebuilt portable `gfx1151` ABI v3 all-HIP library). Download the release with the Hugging Face CLI:
+This Hugging Face repository contains the unmodified upstream model and DSpark draft checkpoint, the separate CIRU fitted weight banks under `optimized-weights/`, and the full v1.6.0 runtime bundle (including the prebuilt portable `gfx1151` ABI v3 all-HIP library). Download the release with the Hugging Face CLI:
 
 ```bash
 hf download jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151 --local-dir ./weights
 ```
 
-**Upgrading from v1.4.0 (or v1.2.x/v1.3.x):** Model and fitted weight files (`WEIGHTS.sha256`) are unchanged. Fetch tag `v1.5.0` in the GitHub runtime repository, install into a new prefix (`~/.local/opt/inkling-halo-v1.5.0`), and restart the server pointing at your existing `--model` directory.
+**Upgrading from v1.4.0 (or v1.2.x/v1.3.x):** Model and fitted weight files (`WEIGHTS.sha256`) are unchanged. Fetch tag `v1.6.0` in the GitHub runtime repository, install into a new prefix (`~/.local/opt/inkling-halo-v1.6.0`), and restart the server pointing at your existing `--model` directory.
 
 Quick launch examples after installing:
 
 ```bash
-# Default all-in-one server (vision + prefix cache + 8 slots + 1M ctx + all-HIP prefill & decode + adaptive K=7@B=1 / K=4@B=2..8)
+# Fastest v1.6.0 server with Inco AI DFlash 2 (81 tok/s B=1 T=1.0, 220+ tok/s B=8, 1M ctx, 48 GiB KV = 1.27M tokens)
+hf download incoai/Inkling-2-Mini-DFlash2 --local-dir ./dflash2
+"$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --dflash2 ./dflash2 --kv-mib 49152 --tools
+
+# Default self-contained server with bundled adaptive DSpark (no extra drafter download required)
 "$INKLING_ROOT/serve.sh" --model "$INKLING_MODEL" --tools
 
 # Text-only adaptive multi-agent server (same fast stack without vision encoder)
@@ -135,5 +159,6 @@ Use `--context` to set a different request limit and `--kv-mib` to set the KV ca
 ## Credits and license
 
 - Thinking Machines Lab developed Inkling 2 Mini and supplied the original checkpoint and DSpark draft weights. [Upstream model](https://huggingface.co/thinkingmachines/Inkling-2-Mini) · [Model Acceptable Use Policy](https://thinkingmachines.ai/model-acceptable-use-policy/)
+- Inco AI trained and released the open-weights DFlash 2 block-diffusion drafter ([`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)).
 - CIRU developed the Strix Halo runtime integration, native RDNA 3.5 HIP and Triton kernels, adaptive speculative HIP graphs, and optimized expert weights. The runtime builds on vLLM's Inkling support, Hugging Face Transformers, Triton, PyTorch, and AMD ROCm. [vLLM](https://github.com/vllm-project/vllm) · [Transformers](https://github.com/huggingface/transformers) · [Triton](https://github.com/triton-lang/triton) · [PyTorch](https://pytorch.org/) · [AMD ROCm](https://github.com/ROCm)
 - The model weights and CIRU runtime are provided under Apache 2.0. [License](LICENSE) · [Notice](NOTICE)
