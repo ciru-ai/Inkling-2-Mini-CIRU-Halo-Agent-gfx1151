@@ -119,7 +119,7 @@ The same runtime serves the unmodified Thinking Machines Lab checkpoint mirrored
 
 ## Install, upgrade, and run
 
-Install or upgrade the ROCm vLLM runtime from the companion GitHub repository. The installation guide covers GPU access, pinned ROCm 10 wheels, the checked-in installer, upgrade steps from v1.2.x–v1.4.0, launch commands for every mode (`vision`, `concurrent`, `single`, `long-context`, `sampling`), and smoke-test verification. [GitHub runtime](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151) · [Installation guide](INSTALL.md) · [v1.5.0 release](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151/releases/tag/v1.5.0)
+Install or upgrade the ROCm vLLM runtime from the companion GitHub repository. The installation guide covers GPU access, pinned ROCm 10 wheels, the checked-in installer, upgrade steps from v1.2.x–v1.5.0, launch commands for `--dflash2` and every mode (`vision`, `concurrent`, `single`, `long-context`, `sampling`), and smoke-test verification. [GitHub runtime](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151) · [Installation guide](INSTALL.md) · [v1.6.0 release](https://github.com/ciru-ai/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151/releases/tag/v1.6.0)
 
 This Hugging Face repository contains the unmodified upstream model and DSpark draft checkpoint, the separate CIRU fitted weight banks under `optimized-weights/`, and the full v1.6.0 runtime bundle (including the prebuilt portable `gfx1151` ABI v3 all-HIP library). Download the release with the Hugging Face CLI:
 
@@ -127,7 +127,7 @@ This Hugging Face repository contains the unmodified upstream model and DSpark d
 hf download jcbtc/Inkling-2-Mini-CIRU-Halo-Agent-gfx1151 --local-dir ./weights
 ```
 
-**Upgrading from v1.4.0 (or v1.2.x/v1.3.x):** Model and fitted weight files (`WEIGHTS.sha256`) are unchanged. Fetch tag `v1.6.0` in the GitHub runtime repository, install into a new prefix (`~/.local/opt/inkling-halo-v1.6.0`), and restart the server pointing at your existing `--model` directory.
+**Upgrading from v1.5.0 (or v1.2.x–v1.4.0):** Model and fitted weight files (`WEIGHTS.sha256`) are unchanged. Fetch tag `v1.6.0` in the GitHub runtime repository, install into a new prefix (`~/.local/opt/inkling-halo-v1.6.0`), and restart the server pointing at your existing `--model` directory.
 
 Quick launch examples after installing:
 
