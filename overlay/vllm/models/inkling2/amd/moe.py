@@ -546,7 +546,7 @@ class Inkling2MoE(nn.Module):
     def process_weights_after_loading(self):
         if self._prepared:
             return
-        directory = os.getenv("INKLING_AMD_EXPERT_BANK")
+        directory = os.getenv("INKLING_AMD_EXPERT_BANK") or None
         policy = os.getenv("INKLING_AMD_EXPERT_POLICY", "source")
         if policy not in POLICIES or (policy != "source" and directory is None):
             raise ValueError(f"Invalid Inkling AMD expert policy or missing bank: {policy}")

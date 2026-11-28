@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Portable launcher for Inkling 2 Mini CIRU Halo Agent (gfx1151) v1.6.0.
+# Portable launcher for Inkling 2 Mini CIRU Halo Agent (gfx1151) v1.7.0.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -161,15 +161,19 @@ if [[ "$prefix_cache" == auto ]]; then
     if [[ "$mode" == vision ]]; then prefix_cache=1; else prefix_cache=0; fi
 fi
 if (( ! original_weights )) && [[ -d "$model/optimized-weights" ]]; then
-    expert_bank="$model/optimized-weights/experts"
-    for layer in 6 12 17; do
-        [[ -s "$expert_bank/layer$layer.pt" ]] || die "missing fitted expert weights for layer $layer; download the full bundle"
-    done
-    coda_c1_dir="$model/optimized-weights/final-layers"
-    for layer in 20 21 22 23; do
-        [[ -s "$coda_c1_dir/layer$layer-c1.safetensors" ]] || die "missing fitted final-layer weights for layer $layer; download the full bundle"
-    done
-    expert_policy=c1-down
+    if [[ -d "$model/optimized-weights/experts" ]]; then
+        expert_bank="$model/optimized-weights/experts"
+        for layer in 6 12 17; do
+            [[ -s "$expert_bank/layer$layer.pt" ]] || die "missing fitted expert weights for layer $layer; download the full bundle"
+        done
+        expert_policy=c1-down
+    fi
+    if [[ -d "$model/optimized-weights/final-layers" ]]; then
+        coda_c1_dir="$model/optimized-weights/final-layers"
+        for layer in 20 21 22 23; do
+            [[ -s "$coda_c1_dir/layer$layer-c1.safetensors" ]] || die "missing fitted final-layer weights for layer $layer; download the full bundle"
+        done
+    fi
 fi
 
 if [[ -z "$python_bin" ]]; then
@@ -302,9 +306,7 @@ settings=(
     OMP_NUM_THREADS=4
     OPENBLAS_NUM_THREADS=4
     "INKLING_AMD_EXPERT_POLICY=$expert_policy"
-    "INKLING_AMD_EXPERT_BANK=$expert_bank"
-    "INKLING_AMD_CODA_C1_DIR=$coda_c1_dir"
-    INKLING_AMD_CODA_C1_KEEP_FINAL_MXFP8=0
+    "INKLING_AMD_CODA_C1_KEEP_FINAL_MXFP8=${INKLING_AMD_CODA_C1_KEEP_FINAL_MXFP8:-0}"
     INKLING_AMD_PACKED_PREFILL=1
     INKLING_AMD_PACKED_MXFP8_PREFILL=1
     INKLING_AMD_PACKED_MXFP8=1
@@ -337,7 +339,7 @@ settings=(
     INKLING_AMD_W6_HEAD_WAVES=4
     INKLING_AMD_LOOP_GEMV=both
     INKLING_AMD_DSPARK_PHASE_SWITCH=0
-    INKLING_AMD_SOURCE_WMMA_N_FAST=0
+    "INKLING_AMD_SOURCE_WMMA_N_FAST=${INKLING_AMD_SOURCE_WMMA_N_FAST:-0}"
     "INKLING_AMD_DECODE_GRAPH=$plain_graph"
     "INKLING_AMD_DSPARK_TARGET_GRAPH=$target_graph"
     "INKLING_AMD_SOURCE_WMMA_PRETILE=$((target_graph || turbo))"
@@ -373,6 +375,12 @@ fi
 bundled_hip_so="$SCRIPT_DIR/rocm/hip_inkling_gfx1151_07458d24acf9.so"
 if [[ -z "${INKLING_AMD_HIP_SO:-}" && -z "${INKLING_AMD_HIP_PREFILL_SO:-}" && -f "$bundled_hip_so" ]]; then
     settings+=("INKLING_AMD_HIP_SO=$bundled_hip_so")
+fi
+if [[ -n "$expert_bank" ]]; then
+    settings+=("INKLING_AMD_EXPERT_BANK=$expert_bank")
+fi
+if [[ -n "$coda_c1_dir" ]]; then
+    settings+=("INKLING_AMD_CODA_C1_DIR=$coda_c1_dir")
 fi
 if [[ -n "$joined_pypath" ]]; then
     settings=("PYTHONPATH=$joined_pypath" "${settings[@]}")
@@ -452,7 +460,7 @@ if [[ -n "${INKLING_CHAT_TEMPLATE_KWARGS:-}" ]]; then
     command+=(--default-chat-template-kwargs "$INKLING_CHAT_TEMPLATE_KWARGS")
 fi
 if (( dry_run )); then
-    printf 'Inkling 2 Mini CIRU Halo Agent v1.6.0 (%s, adaptive=%s, vision=%s, prefix_cache=%s)\n' \
+    printf 'Inkling 2 Mini CIRU Halo Agent v1.7.0 (%s, adaptive=%s, vision=%s, prefix_cache=%s)\n' \
         "$mode" "$adaptive_spec" "$vision" "$prefix_cache"
     printf 'Environment:\n'
     printf '  %q\n' "${settings[@]}"
@@ -483,9 +491,10 @@ mkdir -p "$triton_cache"
 source "$SCRIPT_DIR/rocm/rocr-env.sh"
 ciru_use_fixed_rocr "$python_bin" || die 'ROCm idle CPU fix could not be loaded'
 
+unset INKLING_AMD_EXPERT_BANK INKLING_AMD_CODA_C1_DIR INKLING_AMD_CODA_C1
 for s in "${settings[@]}"; do
     export "$s"
 done
-printf 'Starting Inkling 2 Mini CIRU Halo Agent v1.6.0, mode=%s context=%s sequences=%s KV memory=%s MiB adaptive=%s vision=%s\n' \
+printf 'Starting Inkling 2 Mini CIRU Halo Agent v1.7.0, mode=%s context=%s sequences=%s KV memory=%s MiB adaptive=%s vision=%s\n' \
     "$mode" "$context" "$seqs" "$kv_mib" "$adaptive_spec" "$vision"
 exec "${command[@]}"
